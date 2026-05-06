@@ -45,6 +45,7 @@ from core.sim.coverage_spiral import EllipticShiftingSpiralPlanner
 from core.sim.drone import Drone
 from core.sim.target import Target, TargetSet
 from core.sim.tracks import Track, TrackSet
+from core.planners.planner_state import PlannerInput, make_planner_input
 
 
 class PlannerProtocol(Protocol):
@@ -173,6 +174,10 @@ class SimulationState:
     targets: TargetSet
     tracks: TrackSet
 
+    imitation_logger: object | None = None
+    episode_id: int = 0
+    split: str = "train"
+
     mode: Mode = Mode.CHOOSE_TARGET
     selected_track_id: int | None = None
     spiral_planner: EllipticShiftingSpiralPlanner | None = None
@@ -240,15 +245,21 @@ class SimulationState:
     # Planning / action lifecycle
     # ------------------------------------------------------------------
 
+    def make_planner_input(self) -> PlannerInput:
+        """Build the exact standardized decision snapshot given to planners."""
+
+        return make_planner_input(
+            tracks=self.available_tracks_for_planning(),
+            drone=self.drone,
+            targets=self.targets,
+            full_tracks_for_lost_count=self.tracks,
+        )
+
     def choose_target(self) -> None:
-        """Choose the next target.
+        """Choose the next target using standardized planner input."""
 
-        If the current planner has been planning conditionally in the background,
-        use that staged recommendation. Otherwise ask the planner from scratch.
-        """
-
-        available_tracks = self.available_tracks_for_planning()
-        valid_actions = available_tracks.valid_action_ids()
+        planner_input = self.make_planner_input()
+        valid_actions = planner_input.valid_action_ids
 
         if not valid_actions:
             self.mode = Mode.DONE
@@ -256,12 +267,17 @@ class SimulationState:
             return
 
         selected_id: int | None = None
+        decision_source = "planner_choose"
+
+        staged_track_id = self.planned_next_track_id
+        staged_outcome = self.planned_next_outcome
 
         if (
-            self.planned_next_track_id is not None
-            and int(self.planned_next_track_id) in valid_actions
+            staged_track_id is not None
+            and int(staged_track_id) in valid_actions
         ):
-            selected_id = int(self.planned_next_track_id)
+            selected_id = int(staged_track_id)
+            decision_source = f"conditional_{staged_outcome or 'unknown'}"
 
         # Consume the staged recommendation whether valid or invalid.
         self.planned_next_track_id = None
@@ -270,9 +286,7 @@ class SimulationState:
         if selected_id is None:
             selected_id = int(
                 self.planner.choose_track(
-                    tracks=available_tracks,
-                    drone=self.drone,
-                    targets=self.targets,
+                    planner_input=planner_input,
                     rng=self.rng,
                 )
             )
@@ -280,6 +294,13 @@ class SimulationState:
         if selected_id not in valid_actions:
             # Hard safety fallback: no planner is allowed to select a lost target.
             selected_id = int(valid_actions[0])
+            decision_source = f"{decision_source}_fallback"
+
+        self.log_imitation_decision(
+            planner_input=planner_input,
+            selected_track_id=int(selected_id),
+            source=decision_source,
+        )
 
         self.selected_track_id = int(selected_id)
         selected_track = self.tracks[self.selected_track_id]
@@ -304,9 +325,7 @@ class SimulationState:
         method = getattr(self.planner, "start_conditional_planning", None)
         if callable(method):
             method(
-                tracks=self.available_tracks_for_planning(),
-                drone=self.drone,
-                targets=self.targets,
+                planner_input=self.make_planner_input(),
                 rng=self.rng,
                 current_action=int(self.selected_track_id),
             )
@@ -322,12 +341,11 @@ class SimulationState:
             return
 
         method(
-            tracks=self.available_tracks_for_planning(),
-            drone=self.drone,
-            targets=self.targets,
+            planner_input=self.make_planner_input(),
             rng=self.rng,
             planning_seconds=float(planning_seconds),
         )
+
         self.background_planning_seconds += float(planning_seconds)
         self.background_planning_calls += 1
 
@@ -340,9 +358,7 @@ class SimulationState:
         if callable(method):
             next_id = method(
                 outcome=outcome,
-                tracks=self.available_tracks_for_planning(),
-                drone=self.drone,
-                targets=self.targets,
+                planner_input=self.make_planner_input(),
                 rng=self.rng,
             )
 
@@ -516,6 +532,35 @@ class SimulationState:
     # Logging
     # ------------------------------------------------------------------
 
+    def log_imitation_decision(
+        self,
+        *,
+        planner_input: PlannerInput,
+        selected_track_id: int,
+        source: str,
+    ) -> None:
+        """Optionally log one imitation-learning decision."""
+
+        if self.imitation_logger is None:
+            return
+
+        method = getattr(self.imitation_logger, "log_decision", None)
+
+        if not callable(method):
+            raise TypeError(
+                "imitation_logger must expose a log_decision(...) method."
+            )
+
+        method(
+            planner_input=planner_input,
+            selected_track_id=int(selected_track_id),
+            episode_id=int(self.episode_id),
+            scenario_seed=int(self.config.seed),
+            decision_index=int(self.decision_count),
+            split=str(self.split),
+            source=str(source),
+        )
+
     def log_frame(
         self,
         event: str,
@@ -662,7 +707,13 @@ def make_initial_tracks_from_targets(targets: TargetSet, config: SimConfig) -> T
     return TrackSet(tracks)
 
 
-def make_simulation(config: SimConfig, planner: PlannerProtocol) -> SimulationState:
+def make_simulation(
+    config: SimConfig,
+    planner: PlannerProtocol,
+    imitation_logger: object | None = None,
+    episode_id: int = 0,
+    split: str = "train",
+) -> SimulationState:
     rng = np.random.default_rng(config.seed)
 
     drone = Drone(
@@ -684,6 +735,9 @@ def make_simulation(config: SimConfig, planner: PlannerProtocol) -> SimulationSt
         drone=drone,
         targets=targets,
         tracks=tracks,
+        imitation_logger=imitation_logger,
+        episode_id=int(episode_id),
+        split=str(split),
     )
 
 

@@ -70,13 +70,15 @@ class CartesianTrackFeatureExtractor:
 
     Track:
         [is_active, existence_probability,
-         dx, dy, vx, vy,
+         x, y,
+         dx, dy,
+         vx, vy,
          sigma_xx, sigma_yy, sigma_xy,
          trace, logdet, time_since_seen, distance_to_drone]
     """
 
     global_dim = 7
-    track_dim = 13
+    track_dim = 15
 
     def __init__(
         self,
@@ -130,13 +132,20 @@ class CartesianTrackFeatureExtractor:
                 [
                     1.0 if is_active else 0.0,
                     float(track.existence_probability),
+
+                    float(track.position[0]) / self.position_scale,
+                    float(track.position[1]) / self.position_scale,
+
                     dx / self.position_scale,
                     dy / self.position_scale,
+
                     float(track.velocity[0]) / self.velocity_scale,
                     float(track.velocity[1]) / self.velocity_scale,
+
                     float(cov[0, 0]) / self.covariance_scale,
                     float(cov[1, 1]) / self.covariance_scale,
                     float(cov[0, 1]) / self.covariance_scale,
+
                     trace / self.covariance_scale,
                     logdet / 50.0,
                     float(track.time_since_seen) / self.time_scale,

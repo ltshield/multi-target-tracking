@@ -1,29 +1,15 @@
-"""
-Realtime conditional MCTS planner for multi-target tracking.
+"""Realtime conditional MCTS planner for multi-target tracking.
 
-Plug-in interface expected by simulate_run.py:
+This version consumes standardized PlannerInput.
 
-    choose_track(tracks, drone, targets, rng) -> int
-
-Realtime conditional interface used by the rewritten simulator:
-
-    start_conditional_planning(tracks, drone, targets, rng, current_action)
-    plan_during_execution(tracks, drone, targets, rng, planning_seconds)
-    finish_conditional_planning(outcome, tracks, drone, targets, rng) -> int | None
-
-The planner is intended to model the paper-style behavior:
-
-1. The current pursuit action is fixed while the drone is executing it.
-2. MCTS runs during that execution time.
-3. The tree evaluates conditional branches:
-      current action -> find -> next action
-      current action -> miss -> next action
-4. When the real outcome occurs, the simulator asks for the recommendation
-   from the matching branch.
-
-This implementation rebuilds a fixed-current-action tree from the latest live
-belief at each planning call. That deliberately acts like repeated online
-replanning from the current belief while the drone is in flight/search.
+The key fairness changes are:
+- MCTS receives the same valid_action_ids as every other planner.
+- MCTS never privately invents a different root action set.
+- MCTS terminal/rollout scoring matches the evaluation style:
+    uncertainty cost
+    lost-target penalty
+    optional travel-distance penalty
+    optional detection reward
 """
 
 from __future__ import annotations
@@ -34,8 +20,9 @@ from typing import Literal, Optional
 
 import numpy as np
 
+from core.planners.action_space import validate_action_or_raise
+from core.planners.planner_state import PlannerInput
 from core.sim.drone import Drone
-from core.sim.target import TargetSet
 from core.sim.tracks import Track, TrackSet, constant_velocity_F, constant_velocity_Q
 
 
@@ -113,7 +100,12 @@ class BeliefState:
         K = self.covariance @ H.T @ np.linalg.inv(S)
         I = np.eye(4)
 
-        self.covariance = (I - K @ H) @ self.covariance @ (I - K @ H).T + K @ R @ K.T
+        self.covariance = (
+            (I - K @ H)
+            @ self.covariance
+            @ (I - K @ H).T
+            + K @ R @ K.T
+        )
         self.covariance = 0.5 * (self.covariance + self.covariance.T)
         self.time_since_seen = 0.0
         self.existence_probability = 1.0
@@ -126,6 +118,9 @@ class PlanningState:
     beliefs: dict[int, BeliefState]
     available_actions: tuple[int, ...]
     depth: int = 0
+    distance_traveled: float = 0.0
+    detections: int = 0
+    lost_count_initial: int = 0
 
     def copy(self) -> "PlanningState":
         return PlanningState(
@@ -134,6 +129,9 @@ class PlanningState:
             beliefs={k: v.copy() for k, v in self.beliefs.items()},
             available_actions=tuple(self.available_actions),
             depth=int(self.depth),
+            distance_traveled=float(self.distance_traveled),
+            detections=int(self.detections),
+            lost_count_initial=int(self.lost_count_initial),
         )
 
 
@@ -183,10 +181,8 @@ class ActionNode:
 
 @dataclass(slots=True)
 class MCTSPlanner:
-    # Initial/blocking call budget used only if no conditional recommendation is ready.
     iterations: int = 750
 
-    # Background compute model.
     iterations_per_second: float = 80.0
     min_background_iterations_per_call: int = 1
     max_background_iterations_per_call: int = 250
@@ -194,7 +190,6 @@ class MCTSPlanner:
     max_depth: int = 5
     exploration_weight: float = 1.4
 
-    # Internal model parameters. Keep these roughly aligned with SimConfig.
     max_search_time: float = 65.0
     acceleration_noise_std: float = 0.03
     measurement_noise_std: float = 20.0
@@ -204,13 +199,16 @@ class MCTSPlanner:
     lost_trace_threshold: float = 250_000.0
     lost_target_penalty: float = 1_000_000.0
 
+    uncertainty_weight: float = 1.0
+    travel_distance_weight: float = 0.0
+    detection_reward: float = 0.0
+
     recent_revisit_penalty_window: float = 60.0
     rollout_random_action_probability: float = 0.10
     distance_bias_seconds: float = 30.0
     remove_missed_target_from_branch: bool = False
     root_selection: Literal["visits", "value"] = "value"
 
-    # Realtime conditional planning cache.
     current_action: int | None = None
     cached_recommendations: dict[str, int | None] = field(default_factory=dict)
     cached_values: dict[str, float] = field(default_factory=dict)
@@ -224,61 +222,68 @@ class MCTSPlanner:
 
     def choose_track(
         self,
-        tracks: TrackSet,
-        drone: Drone,
-        targets: TargetSet,
+        planner_input: PlannerInput,
         rng: np.random.Generator,
     ) -> int:
-        """Choose an action from scratch.
+        valid_actions = planner_input.require_valid_actions("MCTSPlanner")
+        candidate_tracks = self._candidate_tracks_from_planner_input(planner_input)
 
-        This is used for the first action, for non-conditional fallback, or if
-        the simulator asks the planner normally.
-        """
-
-        candidate_tracks = self._active_candidate_tracks(tracks)
-        if not candidate_tracks:
-            raise ValueError("MCTSPlanner cannot choose from an empty active TrackSet.")
-
-        root_state = self._make_root_state(candidate_tracks, drone)
+        root_state = self._make_root_state(
+            tracks=candidate_tracks,
+            drone=planner_input.drone,
+            valid_action_ids=valid_actions,
+            lost_count_initial=planner_input.lost_count,
+        )
         root = StateNode(state=root_state)
 
         for _ in range(max(1, int(self.iterations))):
-            leaf = self._tree_policy(root, drone, rng)
-            value = self._rollout(leaf.state.copy(), drone, rng)
+            leaf = self._tree_policy(root, planner_input.drone, rng)
+            value = self._rollout(leaf.state.copy(), planner_input.drone, rng)
             self._backup_state_path(leaf, value)
 
         if not root.action_nodes:
-            return int(rng.choice([track.track_id for track in candidate_tracks]))
+            chosen = int(rng.choice(valid_actions))
+        else:
+            chosen = int(self._best_action_node(root).action)
 
-        best = self._best_action_node(root)
-        return int(best.action)
+        return validate_action_or_raise(
+            chosen,
+            valid_actions,
+            planner_name="MCTSPlanner",
+        )
 
     def start_conditional_planning(
         self,
-        tracks: TrackSet,
-        drone: Drone,
-        targets: TargetSet,
+        planner_input: PlannerInput,
         rng: np.random.Generator,
         current_action: int,
     ) -> None:
-        """Start planning next actions while the current action is executing."""
+        valid_actions = planner_input.require_valid_actions("MCTSPlanner")
 
-        self.current_action = int(current_action)
+        self.current_action = validate_action_or_raise(
+            int(current_action),
+            valid_actions,
+            planner_name="MCTSPlanner.start_conditional_planning",
+        )
         self.cached_recommendations = {"find": None, "miss": None}
         self.cached_values = {"find": -float("inf"), "miss": -float("inf")}
         self.last_background_iterations = 0
 
     def plan_during_execution(
         self,
-        tracks: TrackSet,
-        drone: Drone,
-        targets: TargetSet,
+        planner_input: PlannerInput,
         rng: np.random.Generator,
         planning_seconds: float,
     ) -> None:
-        """Run conditional MCTS for the amount of real execution time available."""
-
         if self.current_action is None or planning_seconds <= 0.0:
+            self.last_background_iterations = 0
+            return
+
+        valid_actions = planner_input.valid_action_ids
+
+        if self.current_action not in valid_actions:
+            self.cached_recommendations["find"] = None
+            self.cached_recommendations["miss"] = None
             self.last_background_iterations = 0
             return
 
@@ -286,27 +291,22 @@ class MCTSPlanner:
         iterations = max(self.min_background_iterations_per_call, iterations)
         iterations = min(self.max_background_iterations_per_call, iterations)
 
-        candidate_tracks = self._active_candidate_tracks(tracks)
-        candidate_ids = {track.track_id for track in candidate_tracks}
-
-        if self.current_action not in candidate_ids:
-            self.cached_recommendations["find"] = None
-            self.cached_recommendations["miss"] = None
-            self.last_background_iterations = 0
-            return
+        candidate_tracks = self._candidate_tracks_from_planner_input(planner_input)
 
         recommendations, values = self._conditional_plan_fixed_action(
             tracks=candidate_tracks,
-            drone=drone,
+            drone=planner_input.drone,
             rng=rng,
             fixed_action=int(self.current_action),
+            valid_action_ids=valid_actions,
             iterations=iterations,
+            lost_count_initial=planner_input.lost_count,
         )
 
         for outcome in ("find", "miss"):
             rec = recommendations.get(outcome)
             val = values.get(outcome, -float("inf"))
-            if rec is not None:
+            if rec is not None and int(rec) in valid_actions:
                 self.cached_recommendations[outcome] = int(rec)
                 self.cached_values[outcome] = float(val)
 
@@ -317,25 +317,21 @@ class MCTSPlanner:
     def finish_conditional_planning(
         self,
         outcome: str,
-        tracks: TrackSet,
-        drone: Drone,
-        targets: TargetSet,
+        planner_input: PlannerInput,
         rng: np.random.Generator,
     ) -> int | None:
-        """Return the cached next action for the realized outcome."""
-
         normalized = "find" if outcome == "find" else "miss"
         rec = self.cached_recommendations.get(normalized)
 
         self.current_action = None
 
-        if rec is not None and self._track_id_is_active(tracks, int(rec)):
+        if rec is not None and int(rec) in planner_input.valid_action_ids:
             return int(rec)
 
-        # Fallback: if no useful background plan exists, choose from scratch.
-        if len(tracks.tracks) == 0:
+        if not planner_input.valid_action_ids:
             return None
-        return int(self.choose_track(tracks, drone, targets, rng))
+
+        return int(self.choose_track(planner_input=planner_input, rng=rng))
 
     def diagnostics(self) -> dict:
         return {
@@ -360,12 +356,22 @@ class MCTSPlanner:
         drone: Drone,
         rng: np.random.Generator,
         fixed_action: int,
+        valid_action_ids: tuple[int, ...],
         iterations: int,
+        lost_count_initial: int,
     ) -> tuple[dict[str, int | None], dict[str, float]]:
-        root_state = self._make_root_state(tracks, drone)
+        root_state = self._make_root_state(
+            tracks=tracks,
+            drone=drone,
+            valid_action_ids=valid_action_ids,
+            lost_count_initial=lost_count_initial,
+        )
 
         if fixed_action not in root_state.available_actions:
-            return {"find": None, "miss": None}, {"find": -float("inf"), "miss": -float("inf")}
+            return (
+                {"find": None, "miss": None},
+                {"find": -float("inf"), "miss": -float("inf")},
+            )
 
         root = StateNode(state=root_state)
         estimate = self._estimate_coverage_outcome(root_state, fixed_action, drone)
@@ -382,10 +388,14 @@ class MCTSPlanner:
             a for a in root.unexpanded_actions if a != fixed_action
         ]
 
-        # Ensure both conditional outcome states exist so we can extract both
-        # next-action recommendations.
         for outcome in ("find", "miss"):
-            next_state = self._transition(root_state, fixed_action, outcome, estimate, drone)
+            next_state = self._transition(
+                root_state,
+                fixed_action,
+                outcome,
+                estimate,
+                drone,
+            )
             child = StateNode(
                 state=next_state,
                 parent_action=fixed_action_node,
@@ -406,7 +416,11 @@ class MCTSPlanner:
 
         for outcome in ("find", "miss"):
             outcome_node = fixed_action_node.outcome_states[outcome]
-            best = self._best_action_node(outcome_node) if outcome_node.action_nodes else None
+            best = (
+                self._best_action_node(outcome_node)
+                if outcome_node.action_nodes
+                else None
+            )
             recommendations[outcome] = None if best is None else int(best.action)
             values[outcome] = -float("inf") if best is None else float(best.mean_value)
 
@@ -416,7 +430,12 @@ class MCTSPlanner:
     # Standard MCTS
     # ------------------------------------------------------------------
 
-    def _tree_policy(self, node: StateNode, drone: Drone, rng: np.random.Generator) -> StateNode:
+    def _tree_policy(
+        self,
+        node: StateNode,
+        drone: Drone,
+        rng: np.random.Generator,
+    ) -> StateNode:
         while not self._is_terminal(node.state):
             if node.unexpanded_actions:
                 return self._expand_state_node(node, drone, rng)
@@ -430,7 +449,13 @@ class MCTSPlanner:
                     expected_find_time=action_node.expected_find_time,
                     miss_time=action_node.miss_time,
                 )
-                next_state = self._transition(node.state, action_node.action, outcome, estimate, drone)
+                next_state = self._transition(
+                    node.state,
+                    action_node.action,
+                    outcome,
+                    estimate,
+                    drone,
+                )
                 child = StateNode(
                     state=next_state,
                     parent_action=action_node,
@@ -443,7 +468,12 @@ class MCTSPlanner:
 
         return node
 
-    def _expand_state_node(self, node: StateNode, drone: Drone, rng: np.random.Generator) -> StateNode:
+    def _expand_state_node(
+        self,
+        node: StateNode,
+        drone: Drone,
+        rng: np.random.Generator,
+    ) -> StateNode:
         idx = int(rng.integers(0, len(node.unexpanded_actions)))
         action = int(node.unexpanded_actions.pop(idx))
 
@@ -459,7 +489,11 @@ class MCTSPlanner:
 
         outcome = self._sample_outcome(action_node, rng)
         next_state = self._transition(node.state, action, outcome, estimate, drone)
-        child = StateNode(state=next_state, parent_action=action_node, outcome_from_parent=outcome)
+        child = StateNode(
+            state=next_state,
+            parent_action=action_node,
+            outcome_from_parent=outcome,
+        )
         action_node.outcome_states[outcome] = child
         return child
 
@@ -497,7 +531,12 @@ class MCTSPlanner:
     # Rollout and value
     # ------------------------------------------------------------------
 
-    def _rollout(self, state: PlanningState, drone: Drone, rng: np.random.Generator) -> float:
+    def _rollout(
+        self,
+        state: PlanningState,
+        drone: Drone,
+        rng: np.random.Generator,
+    ) -> float:
         while not self._is_terminal(state):
             action = self._rollout_policy(state, drone, rng)
             estimate = self._estimate_coverage_outcome(state, action, drone)
@@ -511,31 +550,57 @@ class MCTSPlanner:
         if terminal.remaining_budget > 0.0:
             self._predict_all(terminal, terminal.remaining_budget)
             terminal.remaining_budget = 0.0
+
         return -self._state_cost(terminal)
 
     def _state_cost(self, state: PlanningState) -> float:
-        cost = 0.0
+        active_uncertainty_cost = 0.0
+        newly_lost_count = 0
+
         for belief in state.beliefs.values():
             if self._belief_is_lost(belief):
-                cost += self.lost_target_penalty
+                newly_lost_count += 1
             elif self.use_logdet_objective:
-                cost += belief.position_logdet
+                active_uncertainty_cost += belief.position_logdet
             else:
-                cost += belief.position_trace
-        return float(cost)
+                active_uncertainty_cost += belief.position_trace
+
+        uncertainty_cost = self.uncertainty_weight * active_uncertainty_cost
+
+        # Include both lost targets that were already lost before planning and
+        # targets that become lost inside the imagined rollout.
+        lost_target_cost = self.lost_target_penalty * (
+            state.lost_count_initial + newly_lost_count
+        )
+
+        travel_cost = self.travel_distance_weight * state.distance_traveled
+        detection_bonus = self.detection_reward * state.detections
+
+        return float(
+            uncertainty_cost
+            + lost_target_cost
+            + travel_cost
+            - detection_bonus
+        )
 
     def _belief_is_lost(self, belief: BeliefState) -> bool:
         return belief.position_trace >= self.lost_trace_threshold
 
-    def _rollout_policy(self, state: PlanningState, drone: Drone, rng: np.random.Generator) -> int:
+    def _rollout_policy(
+        self,
+        state: PlanningState,
+        drone: Drone,
+        rng: np.random.Generator,
+    ) -> int:
         actions = [
             int(action)
             for action in state.available_actions
-            if not self._belief_is_lost(state.beliefs[int(action)])
+            if int(action) in state.beliefs
+            and not self._belief_is_lost(state.beliefs[int(action)])
         ]
 
         if not actions:
-            raise RuntimeError("Realtime MCTS rollout policy received no available active actions.")
+            raise RuntimeError("MCTS rollout policy received no available active actions.")
 
         if rng.random() < self.rollout_random_action_probability:
             return int(rng.choice(actions))
@@ -547,24 +612,44 @@ class MCTSPlanner:
             )
         )
 
-    def _heuristic_action_score(self, state: PlanningState, action: int, drone: Drone) -> float:
+    def _heuristic_action_score(
+        self,
+        state: PlanningState,
+        action: int,
+        drone: Drone,
+    ) -> float:
         b = state.beliefs[action]
         if self._belief_is_lost(b):
             return -float("inf")
 
-        uncertainty = b.position_logdet + 50.0 if self.use_logdet_objective else b.position_trace
+        uncertainty = (
+            b.position_logdet + 50.0
+            if self.use_logdet_objective
+            else b.position_trace
+        )
         uncertainty = max(1e-6, uncertainty)
         travel_time = self._travel_time(state.drone_position, b.position, drone.speed)
 
         recent_factor = self._recent_revisit_factor(b.time_since_seen)
         stale_bonus = 1.0 + min(3.0, b.time_since_seen / 120.0)
 
-        return float(recent_factor * stale_bonus * uncertainty / (travel_time + self.distance_bias_seconds))
+        return float(
+            recent_factor
+            * stale_bonus
+            * uncertainty
+            / (travel_time + self.distance_bias_seconds)
+        )
 
     def _recent_revisit_factor(self, time_since_seen: float) -> float:
         if self.recent_revisit_penalty_window <= 0.0:
             return 1.0
-        return float(np.clip(time_since_seen / self.recent_revisit_penalty_window, 0.05, 1.0))
+        return float(
+            np.clip(
+                time_since_seen / self.recent_revisit_penalty_window,
+                0.05,
+                1.0,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Transition and coverage estimation
@@ -581,31 +666,44 @@ class MCTSPlanner:
         next_state = state.copy()
         selected_before_prediction = next_state.beliefs[action]
 
-        travel_time = self._travel_time(
+        travel_distance = self._travel_distance(
             next_state.drone_position,
             selected_before_prediction.position,
-            drone.speed,
         )
-        search_time = estimate.expected_find_time if outcome == "find" else estimate.miss_time
+        travel_time = travel_distance / drone.speed
+
+        search_time = (
+            estimate.expected_find_time
+            if outcome == "find"
+            else estimate.miss_time
+        )
         elapsed = min(next_state.remaining_budget, travel_time + search_time)
 
         self._predict_all(next_state, elapsed)
 
         selected = next_state.beliefs[action]
-        if outcome == "find" and elapsed > travel_time:
-            selected.kalman_position_update_at_mean(self.measurement_noise_std)
+        found = outcome == "find" and elapsed > travel_time
 
-        next_state.drone_position = self._position_after_action(
+        if found:
+            selected.kalman_position_update_at_mean(self.measurement_noise_std)
+            next_state.detections += 1
+
+        new_position = self._position_after_action(
             start=state.drone_position,
             goal=selected.position,
             speed=drone.speed,
             elapsed=elapsed,
         )
+
+        actual_distance = self._travel_distance(state.drone_position, new_position)
+
+        next_state.drone_position = new_position
+        next_state.distance_traveled += actual_distance
         next_state.remaining_budget = max(0.0, next_state.remaining_budget - elapsed)
         next_state.depth += 1
 
         active_actions = tuple(
-            track_id
+            int(track_id)
             for track_id, belief in next_state.beliefs.items()
             if not self._belief_is_lost(belief)
         )
@@ -616,14 +714,27 @@ class MCTSPlanner:
         next_state.available_actions = active_actions
         return next_state
 
-    def _estimate_coverage_outcome(self, state: PlanningState, action: int, drone: Drone) -> CoverageEstimate:
+    def _estimate_coverage_outcome(
+        self,
+        state: PlanningState,
+        action: int,
+        drone: Drone,
+    ) -> CoverageEstimate:
         belief = state.beliefs[action].copy()
-        travel_time = self._travel_time(state.drone_position, belief.position, drone.speed)
+        travel_time = self._travel_time(
+            state.drone_position,
+            belief.position,
+            drone.speed,
+        )
         remaining_after_travel = max(0.0, state.remaining_budget - travel_time)
         miss_time = min(self.max_search_time, remaining_after_travel)
 
         if miss_time <= 0.0:
-            return CoverageEstimate(p_find=0.0, expected_find_time=0.0, miss_time=0.0)
+            return CoverageEstimate(
+                p_find=0.0,
+                expected_find_time=0.0,
+                miss_time=0.0,
+            )
 
         belief.predict(travel_time, self.acceleration_noise_std)
 
@@ -647,8 +758,12 @@ class MCTSPlanner:
             if increments.sum() <= 1e-12:
                 expected_find_time = miss_time
             else:
-                expected_find_time = float(np.sum(times * increments) / increments.sum())
-                expected_find_time = float(np.clip(expected_find_time, 0.0, miss_time))
+                expected_find_time = float(
+                    np.sum(times * increments) / increments.sum()
+                )
+                expected_find_time = float(
+                    np.clip(expected_find_time, 0.0, miss_time)
+                )
 
         return CoverageEstimate(
             p_find=p_find,
@@ -656,13 +771,22 @@ class MCTSPlanner:
             miss_time=float(miss_time),
         )
 
-    def _coverage_cdf(self, belief: BeliefState, drone: Drone, search_time: float) -> float:
+    def _coverage_cdf(
+        self,
+        belief: BeliefState,
+        drone: Drone,
+        search_time: float,
+    ) -> float:
         sensor_width = 2.0 * drone.sensor_range
         initial_area = math.pi * drone.sensor_range**2
         covered_area = initial_area + sensor_width * drone.speed * max(0.0, search_time)
 
         det = max(float(np.linalg.det(belief.position_covariance)), 1e-12)
-        effective_area = math.pi * math.sqrt(det) * (self.covariance_scale_for_detection**2)
+        effective_area = (
+            math.pi
+            * math.sqrt(det)
+            * (self.covariance_scale_for_detection**2)
+        )
         normalized = covered_area / max(effective_area, 1e-12)
 
         return float(np.clip(1.0 - math.exp(-0.5 * normalized), 0.0, 1.0))
@@ -677,19 +801,37 @@ class MCTSPlanner:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _make_root_state(self, tracks: list[Track], drone: Drone) -> PlanningState:
-        beliefs = {int(track.track_id): BeliefState.from_track(track) for track in tracks}
+    def _make_root_state(
+        self,
+        tracks: list[Track],
+        drone: Drone,
+        valid_action_ids: tuple[int, ...],
+        lost_count_initial: int,
+    ) -> PlanningState:
+        valid_set = set(int(a) for a in valid_action_ids)
+
+        beliefs = {
+            int(track.track_id): BeliefState.from_track(track)
+            for track in tracks
+            if int(track.track_id) in valid_set
+        }
+
         active_actions = tuple(
-            track_id
-            for track_id, belief in beliefs.items()
-            if not self._belief_is_lost(belief)
+            int(track_id)
+            for track_id in valid_action_ids
+            if int(track_id) in beliefs
+            and not self._belief_is_lost(beliefs[int(track_id)])
         )
+
         return PlanningState(
             drone_position=drone.position.copy(),
             remaining_budget=float(drone.remaining_budget),
             beliefs=beliefs,
             available_actions=active_actions,
             depth=0,
+            distance_traveled=0.0,
+            detections=0,
+            lost_count_initial=int(lost_count_initial),
         )
 
     def _is_terminal(self, state: PlanningState) -> bool:
@@ -705,17 +847,19 @@ class MCTSPlanner:
         return max(state_node.action_nodes.values(), key=lambda node: node.mean_value)
 
     @staticmethod
-    def _active_candidate_tracks(tracks: TrackSet) -> list[Track]:
-        valid_actions = set(tracks.valid_action_ids())
+    def _candidate_tracks_from_planner_input(
+        planner_input: PlannerInput,
+    ) -> list[Track]:
+        valid_actions = set(int(a) for a in planner_input.valid_action_ids)
         return [
             track
-            for track in tracks.tracks
+            for track in planner_input.tracks.tracks
             if int(track.track_id) in valid_actions
         ]
 
     @staticmethod
-    def _track_id_is_active(tracks: TrackSet, track_id: int) -> bool:
-        return int(track_id) in set(tracks.valid_action_ids())
+    def _travel_distance(start: np.ndarray, goal: np.ndarray) -> float:
+        return float(np.linalg.norm(goal - start))
 
     @staticmethod
     def _travel_time(start: np.ndarray, goal: np.ndarray, speed: float) -> float:
@@ -724,12 +868,20 @@ class MCTSPlanner:
         return float(np.linalg.norm(goal - start) / speed)
 
     @staticmethod
-    def _position_after_action(start: np.ndarray, goal: np.ndarray, speed: float, elapsed: float) -> np.ndarray:
+    def _position_after_action(
+        start: np.ndarray,
+        goal: np.ndarray,
+        speed: float,
+        elapsed: float,
+    ) -> np.ndarray:
         max_distance = speed * max(0.0, elapsed)
         delta = goal - start
         distance = float(np.linalg.norm(delta))
+
         if distance <= 1e-12:
             return goal.copy()
+
         if max_distance >= distance:
             return goal.copy()
+
         return start + delta / distance * max_distance

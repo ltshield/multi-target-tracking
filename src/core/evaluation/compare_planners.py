@@ -1,35 +1,49 @@
 """Run multiple planners, save each run, and compare performance metrics.
 
-This script is meant to sit beside:
-    simulate_run.py
-    planners.py
-    mcts_planner.py
-    visualize_run_pygame.py
+This expanded comparison script supports:
+
+- Running random, greedy, MCTS, warm MCTS, and guided MCTS across many seeds.
+- Saving each full simulation run as JSON.
+- Collecting key scalar metrics:
+    average uncertainty
+    final uncertainty
+    AUC uncertainty
+    number of lost targets
+    number of detections
+    distance traveled
+    number of decisions
+    runtime
+- Generating plots:
+    uncertainty over time
+    active/lost targets over time
+    target selected over time
+    UAV trajectory
+    target trajectories
+    final metric bar charts
+- Comparing MCTS-style planners against greedy:
+    where MCTS beats greedy
+    where long-term planning appears to matter
+    where greedy may be over-focusing on nearby targets
 
 Example from project root:
-    python src/core/compare_planners.py \
+
+    python src/core/evaluation/compare_planners.py \
         --config configs/basic_3target.yaml \
         --output-dir runs/comparison_basic \
-        --seeds 7 8 9
+        --seeds 7 8 9 10 11
 
-Example from src/core:
-    python compare_planners.py \
-        --config ../../configs/basic_3target.yaml \
-        --output-dir ../../runs/comparison_basic \
-        --seeds 7 8 9
+Example with explicit planners:
 
-Outputs:
-    output_dir/
-      random_seed7.json
-      greedy_uncertainty_seed7.json
-      greedy_distance_seed7.json
-      mcts_seed7.json
-      summary_metrics.csv
-      final_uncertainty_trace.png
-      average_uncertainty_trace.png
-      detections.png
-      distance_traveled.png
-      uncertainty_over_time_seed7.png
+    python src/core/evaluation/compare_planners.py \
+        --config configs/basic_3target.yaml \
+        --output-dir runs/comparison_basic \
+        --seeds 7 8 9 \
+        --planners \
+            random=core.planners.random_planner.RandomPlanner \
+            greedy=core.planners.greedy_planners.GreedyDistanceAwarePlanner \
+            mcts=core.planners.mcts_planner.MCTSPlanner \
+            warm_mcts=core.planners.warm_mcts_planner.WarmMCTSPlanner \
+            guided_mcts=core.planners.guided_track_scorer_mcts_modular.GuidedTrackScorerMCTSPlanner
 """
 
 from __future__ import annotations
@@ -37,6 +51,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -54,11 +70,19 @@ from core.sim.simulate_run import (
 
 
 DEFAULT_PLANNERS = {
-    "random": "random_planner.RandomPlanner",
-    "greedy_uncertainty": "greedy_planners.GreedyUncertaintyPlanner",
-    # "greedy_logdet": "greedy_planners.GreedyLogDetPlanner",
-    # "greedy_distance": "greedy_planners.GreedyDistanceAwarePlanner",
-    "mcts": "mcts_planner.MCTSPlanner",
+    "random": "core.planners.random_planner.RandomPlanner",
+    "greedy": "core.planners.greedy_planners.GreedyDistanceAwarePlanner",
+    "mcts": "core.planners.mcts_planner.MCTSPlanner",
+    "warm_mcts": "core.planners.warm_mcts_planner.WarmMCTSPlanner",
+    "guided_mcts": "core.planners.guided_track_scorer_mcts_modular.GuidedTrackScorerMCTSPlanner",
+}
+
+
+MCTS_LIKE_PLANNERS = {
+    "mcts",
+    "warm_mcts",
+    "guided_mcts",
+    "realtime_mcts",
 }
 
 
@@ -78,12 +102,15 @@ def run_planner_once(
     config = replace(base_config, seed=seed)
     planner = load_planner(planner_path)
 
+    start = time.perf_counter()
     sim = make_simulation(config=config, planner=planner)
     run = sim.run()
+    runtime_seconds = time.perf_counter() - start
 
     run["metadata"]["planner_key"] = planner_name
     run["metadata"]["planner_path"] = planner_path
     run["metadata"]["seed"] = seed
+    run["metadata"]["runtime_seconds"] = float(runtime_seconds)
 
     output_path = output_dir / f"{planner_name}_seed{seed}.json"
     save_run(run, output_path)
@@ -95,8 +122,10 @@ def run_planner_once(
             "planner_path": planner_path,
             "seed": seed,
             "run_file": str(output_path),
+            "runtime_seconds": float(runtime_seconds),
         }
     )
+
     return metrics
 
 
@@ -105,6 +134,7 @@ def run_comparison(
     planners: dict[str, str],
     seeds: list[int],
     output_dir: Path,
+    continue_on_error: bool = False,
 ) -> list[dict[str, Any]]:
     """Run all planners across all seeds."""
 
@@ -118,19 +148,42 @@ def run_comparison(
         for planner_name, planner_path in planners.items():
             run_idx += 1
             print(f"[{run_idx}/{total_runs}] Running {planner_name} seed={seed}...")
-            metrics = run_planner_once(
-                base_config=config,
-                planner_name=planner_name,
-                planner_path=planner_path,
-                seed=seed,
-                output_dir=output_dir,
-            )
+
+            try:
+                metrics = run_planner_once(
+                    base_config=config,
+                    planner_name=planner_name,
+                    planner_path=planner_path,
+                    seed=seed,
+                    output_dir=output_dir,
+                )
+            except Exception as exc:
+                if not continue_on_error:
+                    raise
+
+                print(f"    ERROR: {planner_name} seed={seed} failed: {exc}")
+                all_metrics.append(
+                    {
+                        "planner": planner_name,
+                        "planner_path": planner_path,
+                        "seed": seed,
+                        "run_file": "",
+                        "error": str(exc),
+                        "runtime_seconds": math.nan,
+                    }
+                )
+                continue
+
             all_metrics.append(metrics)
             print(
                 f"    final_trace={metrics['final_uncertainty_trace']:.2f} "
                 f"avg_trace={metrics['avg_uncertainty_trace']:.2f} "
+                f"auc={metrics['auc_uncertainty_trace']:.2f} "
+                f"lost={metrics['final_num_lost']} "
                 f"detections={metrics['num_detections']} "
-                f"distance={metrics['distance_traveled']:.2f}"
+                f"decisions={metrics['num_decisions']} "
+                f"distance={metrics['distance_traveled']:.2f} "
+                f"runtime={metrics['runtime_seconds']:.2f}s"
             )
 
     return all_metrics
@@ -148,53 +201,88 @@ def summarize_run(run: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Run has empty history.")
 
     times = np.array([frame["time"] for frame in history], dtype=float)
+
     traces = np.array(
         [frame["metrics"]["total_position_trace"] for frame in history],
         dtype=float,
     )
+
+    active_traces = np.array(
+        [frame["metrics"].get("active_position_trace", np.nan) for frame in history],
+        dtype=float,
+    )
+
     logdets = np.array(
         [frame["metrics"]["total_position_logdet"] for frame in history],
         dtype=float,
     )
 
+    num_lost_series = np.array(
+        [frame["metrics"].get("num_lost", 0) for frame in history],
+        dtype=float,
+    )
+
+    num_active_series = np.array(
+        [frame["metrics"].get("num_active", 0) for frame in history],
+        dtype=float,
+    )
+
     detection_events = [frame for frame in history if frame.get("detections")]
+
     selected_tracks = [
         frame.get("selected_track_id")
         for frame in history
         if frame.get("event") == "choose_target"
     ]
 
+    selected_track_sequence = "-".join(
+        str(x) for x in selected_tracks if x is not None
+    )
+
     final_frame = history[-1]
     final_drone = final_frame["drone"]
     final_metrics = final_frame["metrics"]
+
+    unique_selected_targets = {
+        int(x) for x in selected_tracks if x is not None
+    }
+
+    unique_detected_targets = {
+        int(target_id)
+        for frame in history
+        for target_id in frame.get("detections", [])
+    }
 
     return {
         "final_time": float(final_frame["time"]),
         "num_frames": int(len(history)),
         "num_decisions": int(final_frame.get("decision_count", 0)),
-        "num_detections": int(sum(len(frame.get("detections", [])) for frame in history)),
-        "num_detection_events": int(len(detection_events)),
-        "unique_detected_targets": int(
-            len(
-                {
-                    target_id
-                    for frame in history
-                    for target_id in frame.get("detections", [])
-                }
-            )
+        "num_detections": int(
+            sum(len(frame.get("detections", [])) for frame in history)
         ),
+        "num_detection_events": int(len(detection_events)),
+        "unique_detected_targets": int(len(unique_detected_targets)),
+        "unique_selected_targets": int(len(unique_selected_targets)),
         "final_uncertainty_trace": float(traces[-1]),
         "avg_uncertainty_trace": float(np.mean(traces)),
         "min_uncertainty_trace": float(np.min(traces)),
         "max_uncertainty_trace": float(np.max(traces)),
         "auc_uncertainty_trace": area_under_curve(times, traces),
+        "final_active_uncertainty_trace": float(active_traces[-1]),
+        "avg_active_uncertainty_trace": float(np.nanmean(active_traces)),
+        "auc_active_uncertainty_trace": area_under_curve(times, active_traces),
         "final_uncertainty_logdet": float(logdets[-1]),
         "avg_uncertainty_logdet": float(np.mean(logdets)),
         "auc_uncertainty_logdet": area_under_curve(times, logdets),
         "final_num_lost": int(final_metrics.get("num_lost", 0)),
+        "max_num_lost": int(np.max(num_lost_series)),
+        "avg_num_lost": float(np.mean(num_lost_series)),
+        "auc_num_lost": area_under_curve(times, num_lost_series),
         "final_num_active": int(final_metrics.get("num_active", 0)),
+        "min_num_active": int(np.min(num_active_series)),
+        "avg_num_active": float(np.mean(num_active_series)),
         "distance_traveled": float(final_drone["distance_traveled"]),
-        "selected_track_sequence": "-".join(str(x) for x in selected_tracks if x is not None),
+        "selected_track_sequence": selected_track_sequence,
     }
 
 
@@ -204,8 +292,12 @@ def area_under_curve(times: np.ndarray, values: np.ndarray) -> float:
     if len(times) < 2:
         return 0.0
 
-    # Some frames, like choose_target, can have the same timestamp as the prior
-    # frame. np.trapz handles this fine; this just keeps the intent explicit.
+    if len(values) != len(times):
+        raise ValueError("times and values must have the same length.")
+
+    if np.any(~np.isfinite(values)):
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
     return float(np.trapz(values, times))
 
 
@@ -213,7 +305,8 @@ def save_metrics_csv(metrics: list[dict[str, Any]], output_path: Path) -> None:
     if not metrics:
         return
 
-    fieldnames = list(metrics[0].keys())
+    fieldnames = sorted({key for row in metrics for key in row.keys()})
+
     with output_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -225,35 +318,271 @@ def save_metrics_csv(metrics: list[dict[str, Any]], output_path: Path) -> None:
 def print_aggregate_table(metrics: list[dict[str, Any]]) -> None:
     """Print mean/std summary by planner."""
 
-    planners = sorted({row["planner"] for row in metrics})
+    valid_rows = [row for row in metrics if "error" not in row]
+    if not valid_rows:
+        print("No successful runs to summarize.")
+        return
+
+    planners = sorted({row["planner"] for row in valid_rows})
+
     metric_names = [
-        "final_uncertainty_trace",
         "avg_uncertainty_trace",
+        "final_uncertainty_trace",
         "auc_uncertainty_trace",
-        "num_detections",
         "final_num_lost",
+        "num_detections",
         "distance_traveled",
+        "num_decisions",
+        "runtime_seconds",
     ]
 
     print("\nAggregate summary across seeds")
-    print("=" * 96)
-    header = f"{'planner':<22}" + "".join(f"{name:<28}" for name in metric_names)
+    print("=" * 128)
+    header = f"{'planner':<18}" + "".join(f"{name:<26}" for name in metric_names)
     print(header)
-    print("-" * 96)
+    print("-" * 128)
 
     for planner in planners:
-        rows = [row for row in metrics if row["planner"] == planner]
-        line = f"{planner:<22}"
+        rows = [row for row in valid_rows if row["planner"] == planner]
+        line = f"{planner:<18}"
+
         for name in metric_names:
-            vals = np.array([row[name] for row in rows], dtype=float)
-            line += f"{np.mean(vals):.2f} ± {np.std(vals):.2f}".ljust(28)
+            vals = np.array([row.get(name, np.nan) for row in rows], dtype=float)
+            vals = vals[np.isfinite(vals)]
+
+            if len(vals) == 0:
+                cell = "n/a"
+            else:
+                cell = f"{np.mean(vals):.2f} ± {np.std(vals):.2f}"
+
+            line += cell.ljust(26)
+
         print(line)
 
-    print("=" * 96)
+    print("=" * 128)
 
 
 # ---------------------------------------------------------------------------
-# Plotting
+# MCTS-vs-greedy analysis
+# ---------------------------------------------------------------------------
+
+def analyze_mcts_vs_greedy(
+    metrics: list[dict[str, Any]],
+    output_path: Path,
+    greedy_name: str = "greedy",
+) -> list[dict[str, Any]]:
+    """Compare MCTS-style planners against greedy on each seed."""
+
+    valid_rows = [row for row in metrics if "error" not in row]
+    by_seed_planner = {
+        (int(row["seed"]), str(row["planner"])): row
+        for row in valid_rows
+    }
+
+    seeds = sorted({int(row["seed"]) for row in valid_rows})
+    planner_names = sorted({str(row["planner"]) for row in valid_rows})
+
+    candidate_mcts_names = [
+        name
+        for name in planner_names
+        if name in MCTS_LIKE_PLANNERS or "mcts" in name.lower()
+    ]
+
+    comparisons: list[dict[str, Any]] = []
+
+    for seed in seeds:
+        greedy = by_seed_planner.get((seed, greedy_name))
+        if greedy is None:
+            continue
+
+        for planner_name in candidate_mcts_names:
+            if planner_name == greedy_name:
+                continue
+
+            candidate = by_seed_planner.get((seed, planner_name))
+            if candidate is None:
+                continue
+
+            final_delta = (
+                float(candidate["final_uncertainty_trace"])
+                - float(greedy["final_uncertainty_trace"])
+            )
+            avg_delta = (
+                float(candidate["avg_uncertainty_trace"])
+                - float(greedy["avg_uncertainty_trace"])
+            )
+            auc_delta = (
+                float(candidate["auc_uncertainty_trace"])
+                - float(greedy["auc_uncertainty_trace"])
+            )
+            lost_delta = int(candidate["final_num_lost"]) - int(greedy["final_num_lost"])
+            detection_delta = int(candidate["num_detections"]) - int(greedy["num_detections"])
+            distance_delta = (
+                float(candidate["distance_traveled"])
+                - float(greedy["distance_traveled"])
+            )
+
+            # Lower uncertainty/lost is better. More detections can be good but is
+            # not automatically decisive.
+            beats_greedy_primary = (
+                auc_delta < 0.0
+                and final_delta <= 0.0
+                and lost_delta <= 0
+            )
+
+            comparisons.append(
+                {
+                    "seed": seed,
+                    "planner": planner_name,
+                    "baseline": greedy_name,
+                    "planner_final_uncertainty": candidate["final_uncertainty_trace"],
+                    "greedy_final_uncertainty": greedy["final_uncertainty_trace"],
+                    "delta_final_uncertainty": final_delta,
+                    "planner_avg_uncertainty": candidate["avg_uncertainty_trace"],
+                    "greedy_avg_uncertainty": greedy["avg_uncertainty_trace"],
+                    "delta_avg_uncertainty": avg_delta,
+                    "planner_auc_uncertainty": candidate["auc_uncertainty_trace"],
+                    "greedy_auc_uncertainty": greedy["auc_uncertainty_trace"],
+                    "delta_auc_uncertainty": auc_delta,
+                    "planner_lost": candidate["final_num_lost"],
+                    "greedy_lost": greedy["final_num_lost"],
+                    "delta_lost": lost_delta,
+                    "planner_detections": candidate["num_detections"],
+                    "greedy_detections": greedy["num_detections"],
+                    "delta_detections": detection_delta,
+                    "planner_distance": candidate["distance_traveled"],
+                    "greedy_distance": greedy["distance_traveled"],
+                    "delta_distance": distance_delta,
+                    "beats_greedy_primary": beats_greedy_primary,
+                    "possible_long_term_planning_win": (
+                        auc_delta < 0.0
+                        and distance_delta >= 0.0
+                        and lost_delta <= 0
+                    ),
+                }
+            )
+
+    save_dicts_csv(comparisons, output_path)
+    print_mcts_vs_greedy_summary(comparisons)
+
+    return comparisons
+
+
+def print_mcts_vs_greedy_summary(comparisons: list[dict[str, Any]]) -> None:
+    if not comparisons:
+        print("\nNo MCTS-vs-greedy comparisons were produced.")
+        return
+
+    planners = sorted({row["planner"] for row in comparisons})
+
+    print("\nMCTS-style planners vs greedy")
+    print("=" * 96)
+
+    for planner in planners:
+        rows = [row for row in comparisons if row["planner"] == planner]
+        wins = sum(1 for row in rows if row["beats_greedy_primary"])
+        long_term = sum(1 for row in rows if row["possible_long_term_planning_win"])
+
+        auc_deltas = np.array([row["delta_auc_uncertainty"] for row in rows], dtype=float)
+        final_deltas = np.array([row["delta_final_uncertainty"] for row in rows], dtype=float)
+        lost_deltas = np.array([row["delta_lost"] for row in rows], dtype=float)
+
+        print(
+            f"{planner:<18} "
+            f"wins={wins}/{len(rows)} | "
+            f"long_term_flags={long_term}/{len(rows)} | "
+            f"mean_delta_auc={np.mean(auc_deltas):.2f} | "
+            f"mean_delta_final={np.mean(final_deltas):.2f} | "
+            f"mean_delta_lost={np.mean(lost_deltas):.2f}"
+        )
+
+    print("=" * 96)
+
+
+def save_dicts_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
+    if not rows:
+        return
+
+    fieldnames = sorted({key for row in rows for key in row.keys()})
+
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved analysis CSV to: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot loading helpers
+# ---------------------------------------------------------------------------
+
+def load_run(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def run_path_for(output_dir: Path, planner_name: str, seed: int) -> Path:
+    return output_dir / f"{planner_name}_seed{seed}.json"
+
+
+def available_successful_planners(
+    output_dir: Path,
+    planners: dict[str, str],
+    seed: int,
+) -> list[str]:
+    names = []
+
+    for planner_name in planners:
+        if run_path_for(output_dir, planner_name, seed).exists():
+            names.append(planner_name)
+
+    return names
+
+
+def extract_series(run: dict[str, Any], key: str) -> tuple[np.ndarray, np.ndarray]:
+    """Extract common time series from a run."""
+
+    history = run["history"]
+    times = np.array([frame["time"] for frame in history], dtype=float)
+
+    if key == "total_uncertainty":
+        values = np.array(
+            [frame["metrics"]["total_position_trace"] for frame in history],
+            dtype=float,
+        )
+    elif key == "active_uncertainty":
+        values = np.array(
+            [frame["metrics"].get("active_position_trace", np.nan) for frame in history],
+            dtype=float,
+        )
+    elif key == "num_lost":
+        values = np.array(
+            [frame["metrics"].get("num_lost", 0) for frame in history],
+            dtype=float,
+        )
+    elif key == "num_active":
+        values = np.array(
+            [frame["metrics"].get("num_active", 0) for frame in history],
+            dtype=float,
+        )
+    elif key == "selected_track":
+        values = np.array(
+            [
+                np.nan if frame.get("selected_track_id") is None
+                else float(frame.get("selected_track_id"))
+                for frame in history
+            ],
+            dtype=float,
+        )
+    else:
+        raise ValueError(f"Unknown series key: {key}")
+
+    return times, values
+
+
+# ---------------------------------------------------------------------------
+# Plotting: aggregate metric bars
 # ---------------------------------------------------------------------------
 
 def make_bar_plot(
@@ -263,16 +592,28 @@ def make_bar_plot(
     title: str,
     output_path: Path,
 ) -> None:
-    planners = sorted({row["planner"] for row in metrics})
+    valid_rows = [row for row in metrics if "error" not in row]
+    if not valid_rows:
+        return
+
+    planners = sorted({row["planner"] for row in valid_rows})
     means = []
     stds = []
 
     for planner in planners:
-        vals = np.array([row[metric_name] for row in metrics if row["planner"] == planner], dtype=float)
-        means.append(float(np.mean(vals)))
-        stds.append(float(np.std(vals)))
+        vals = np.array(
+            [
+                row[metric_name]
+                for row in valid_rows
+                if row["planner"] == planner and metric_name in row
+            ],
+            dtype=float,
+        )
+        vals = vals[np.isfinite(vals)]
+        means.append(float(np.mean(vals)) if len(vals) else 0.0)
+        stds.append(float(np.std(vals)) if len(vals) else 0.0)
 
-    plt.figure(figsize=(10, 5))
+    plt.figure(figsize=(11, 5))
     x = np.arange(len(planners))
     plt.bar(x, means, yerr=stds, capsize=5)
     plt.xticks(x, planners, rotation=25, ha="right")
@@ -284,27 +625,86 @@ def make_bar_plot(
     print(f"Saved plot: {output_path}")
 
 
+def make_final_metric_bar_charts(
+    metrics: list[dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    specs = [
+        (
+            "avg_uncertainty_trace",
+            "Average total covariance trace",
+            "Average uncertainty by planner",
+            "average_uncertainty_trace.png",
+        ),
+        (
+            "final_uncertainty_trace",
+            "Final total covariance trace",
+            "Final uncertainty by planner",
+            "final_uncertainty_trace.png",
+        ),
+        (
+            "auc_uncertainty_trace",
+            "AUC of total covariance trace",
+            "Time-integrated uncertainty by planner",
+            "auc_uncertainty_trace.png",
+        ),
+        (
+            "final_num_lost",
+            "Final number of lost targets",
+            "Lost targets by planner",
+            "lost_targets.png",
+        ),
+        (
+            "num_detections",
+            "Number of detections",
+            "Detections by planner",
+            "detections.png",
+        ),
+        (
+            "distance_traveled",
+            "Distance traveled",
+            "Distance traveled by planner",
+            "distance_traveled.png",
+        ),
+        (
+            "num_decisions",
+            "Number of decisions",
+            "Decisions by planner",
+            "num_decisions.png",
+        ),
+        (
+            "runtime_seconds",
+            "Runtime seconds",
+            "Runtime by planner",
+            "runtime_seconds.png",
+        ),
+    ]
+
+    for metric_name, ylabel, title, filename in specs:
+        make_bar_plot(
+            metrics=metrics,
+            metric_name=metric_name,
+            ylabel=ylabel,
+            title=title,
+            output_path=output_dir / filename,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Plotting: time series
+# ---------------------------------------------------------------------------
+
 def make_uncertainty_time_plot(
     output_dir: Path,
     planners: dict[str, str],
     seed: int,
     output_path: Path,
 ) -> None:
-    """Plot total uncertainty over time for one representative seed."""
+    plt.figure(figsize=(11, 5))
 
-    plt.figure(figsize=(10, 5))
-
-    for planner_name in planners:
-        run_path = output_dir / f"{planner_name}_seed{seed}.json"
-        if not run_path.exists():
-            continue
-
-        with run_path.open("r", encoding="utf-8") as f:
-            run = json.load(f)
-
-        history = run["history"]
-        times = [frame["time"] for frame in history]
-        traces = [frame["metrics"]["total_position_trace"] for frame in history]
+    for planner_name in available_successful_planners(output_dir, planners, seed):
+        run = load_run(run_path_for(output_dir, planner_name, seed))
+        times, traces = extract_series(run, "total_uncertainty")
         plt.plot(times, traces, label=planner_name)
 
     plt.xlabel("Mission time")
@@ -318,50 +718,210 @@ def make_uncertainty_time_plot(
     print(f"Saved plot: {output_path}")
 
 
-def make_all_plots(metrics: list[dict[str, Any]], planners: dict[str, str], seeds: list[int], output_dir: Path) -> None:
-    make_bar_plot(
-        metrics,
-        metric_name="final_uncertainty_trace",
-        ylabel="Final total covariance trace",
-        title="Final uncertainty by planner",
-        output_path=output_dir / "final_uncertainty_trace.png",
-    )
-    make_bar_plot(
-        metrics,
-        metric_name="avg_uncertainty_trace",
-        ylabel="Average total covariance trace",
-        title="Average uncertainty by planner",
-        output_path=output_dir / "average_uncertainty_trace.png",
-    )
-    make_bar_plot(
-        metrics,
-        metric_name="auc_uncertainty_trace",
-        ylabel="AUC of total covariance trace",
-        title="Time-integrated uncertainty by planner",
-        output_path=output_dir / "auc_uncertainty_trace.png",
-    )
-    make_bar_plot(
-        metrics,
-        metric_name="num_detections",
-        ylabel="Number of detections",
-        title="Detections by planner",
-        output_path=output_dir / "detections.png",
-    )
-    make_bar_plot(
-        metrics,
-        metric_name="distance_traveled",
-        ylabel="Distance traveled",
-        title="Distance traveled by planner",
-        output_path=output_dir / "distance_traveled.png",
+def make_active_lost_time_plot(
+    output_dir: Path,
+    planners: dict[str, str],
+    seed: int,
+    output_path: Path,
+) -> None:
+    """Plot active/lost target counts over time.
+
+    Uses solid line for active and dashed line for lost for each planner.
+    """
+
+    plt.figure(figsize=(11, 5))
+
+    for planner_name in available_successful_planners(output_dir, planners, seed):
+        run = load_run(run_path_for(output_dir, planner_name, seed))
+
+        times, active = extract_series(run, "num_active")
+        _, lost = extract_series(run, "num_lost")
+
+        plt.plot(times, active, label=f"{planner_name} active")
+        plt.plot(times, lost, linestyle="--", label=f"{planner_name} lost")
+
+    plt.xlabel("Mission time")
+    plt.ylabel("Target count")
+    plt.title(f"Active/lost targets over time, seed={seed}")
+    plt.legend(ncol=2)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+    print(f"Saved plot: {output_path}")
+
+
+def make_selected_target_time_plot(
+    output_dir: Path,
+    planners: dict[str, str],
+    seed: int,
+    output_path: Path,
+) -> None:
+    plt.figure(figsize=(11, 5))
+
+    for planner_name in available_successful_planners(output_dir, planners, seed):
+        run = load_run(run_path_for(output_dir, planner_name, seed))
+        times, selected = extract_series(run, "selected_track")
+
+        # Keep only frames where a selected target exists.
+        mask = np.isfinite(selected)
+        if not np.any(mask):
+            continue
+
+        plt.step(
+            times[mask],
+            selected[mask],
+            where="post",
+            label=planner_name,
+        )
+
+    plt.xlabel("Mission time")
+    plt.ylabel("Selected track ID")
+    plt.title(f"Selected target over time, seed={seed}")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+    print(f"Saved plot: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Plotting: trajectories
+# ---------------------------------------------------------------------------
+
+def make_trajectory_plot_for_run(
+    run: dict[str, Any],
+    title: str,
+    output_path: Path,
+) -> None:
+    """Plot UAV trajectory and target trajectories for one saved run."""
+
+    history = run["history"]
+    if not history:
+        return
+
+    drone_xy = np.array(
+        [frame["drone"]["position"] for frame in history],
+        dtype=float,
     )
 
-    if seeds:
-        make_uncertainty_time_plot(
-            output_dir=output_dir,
-            planners=planners,
-            seed=seeds[0],
-            output_path=output_dir / f"uncertainty_over_time_seed{seeds[0]}.png",
+    target_ids = sorted(
+        {
+            int(target_id)
+            for frame in history
+            for target_id in frame.get("targets", {}).keys()
+        }
+    )
+
+    plt.figure(figsize=(7, 7))
+
+    # UAV trajectory.
+    plt.plot(drone_xy[:, 0], drone_xy[:, 1], label="UAV")
+    plt.scatter(drone_xy[0, 0], drone_xy[0, 1], marker="o", label="UAV start")
+    plt.scatter(drone_xy[-1, 0], drone_xy[-1, 1], marker="x", label="UAV end")
+
+    # Target trajectories.
+    for target_id in target_ids:
+        xy = []
+        active_flags = []
+
+        for frame in history:
+            target = frame.get("targets", {}).get(str(target_id))
+            if target is None:
+                continue
+
+            xy.append(target["position"])
+            active_flags.append(bool(target.get("is_active", True)))
+
+        if not xy:
+            continue
+
+        xy_arr = np.array(xy, dtype=float)
+
+        plt.plot(
+            xy_arr[:, 0],
+            xy_arr[:, 1],
+            linestyle="--",
+            label=f"target {target_id}",
         )
+        plt.scatter(xy_arr[0, 0], xy_arr[0, 1], marker="o")
+        plt.scatter(xy_arr[-1, 0], xy_arr[-1, 1], marker="x")
+
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.title(title)
+    plt.axis("equal")
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="best", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+    print(f"Saved plot: {output_path}")
+
+
+def make_trajectory_plots(
+    output_dir: Path,
+    planners: dict[str, str],
+    seed: int,
+) -> None:
+    """Create one UAV/target trajectory plot per planner for a representative seed."""
+
+    traj_dir = output_dir / f"trajectories_seed{seed}"
+    traj_dir.mkdir(parents=True, exist_ok=True)
+
+    for planner_name in available_successful_planners(output_dir, planners, seed):
+        run = load_run(run_path_for(output_dir, planner_name, seed))
+        make_trajectory_plot_for_run(
+            run=run,
+            title=f"UAV and target trajectories: {planner_name}, seed={seed}",
+            output_path=traj_dir / f"{planner_name}_trajectory_seed{seed}.png",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Plot orchestration
+# ---------------------------------------------------------------------------
+
+def make_all_plots(
+    metrics: list[dict[str, Any]],
+    planners: dict[str, str],
+    seeds: list[int],
+    output_dir: Path,
+) -> None:
+    make_final_metric_bar_charts(metrics, output_dir)
+
+    if not seeds:
+        return
+
+    representative_seed = seeds[0]
+
+    make_uncertainty_time_plot(
+        output_dir=output_dir,
+        planners=planners,
+        seed=representative_seed,
+        output_path=output_dir / f"uncertainty_over_time_seed{representative_seed}.png",
+    )
+
+    make_active_lost_time_plot(
+        output_dir=output_dir,
+        planners=planners,
+        seed=representative_seed,
+        output_path=output_dir / f"active_lost_over_time_seed{representative_seed}.png",
+    )
+
+    make_selected_target_time_plot(
+        output_dir=output_dir,
+        planners=planners,
+        seed=representative_seed,
+        output_path=output_dir / f"selected_target_over_time_seed{representative_seed}.png",
+    )
+
+    make_trajectory_plots(
+        output_dir=output_dir,
+        planners=planners,
+        seed=representative_seed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +932,9 @@ def parse_planner_args(planner_args: list[str] | None) -> dict[str, str]:
     """Parse planner CLI values.
 
     Accepts values like:
-        random=planners.RandomPlanner
-        greedy=planners.GreedyUncertaintyPlanner
-        mcts=mcts_planner.MCTSPlanner
+        random=core.planners.random_planner.RandomPlanner
+        greedy=core.planners.greedy_planners.GreedyDistanceAwarePlanner
+        mcts=core.planners.mcts_planner.MCTSPlanner
 
     If omitted, DEFAULT_PLANNERS is used.
     """
@@ -383,22 +943,34 @@ def parse_planner_args(planner_args: list[str] | None) -> dict[str, str]:
         return DEFAULT_PLANNERS.copy()
 
     planners: dict[str, str] = {}
+
     for item in planner_args:
         if "=" in item:
             name, path = item.split("=", 1)
         else:
             path = item
             name = path.rsplit(".", 1)[-1]
-        planners[name.strip()] = path.strip()
+
+        name = name.strip()
+        path = path.strip()
+
+        if not name:
+            raise ValueError(f"Invalid planner spec with empty name: {item}")
+        if not path:
+            raise ValueError(f"Invalid planner spec with empty path: {item}")
+
+        planners[name] = path
 
     return planners
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="runs/comparison")
     parser.add_argument("--seeds", type=int, nargs="+", default=[7])
+
     parser.add_argument(
         "--planners",
         type=str,
@@ -406,14 +978,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional planner specs like name=module.Class. "
-            "If omitted, random, greedy, and MCTS baselines are run."
+            "If omitted, random, greedy, MCTS, warm MCTS, and guided MCTS are run."
         ),
     )
+
+    parser.add_argument(
+        "--greedy-name",
+        type=str,
+        default="greedy",
+        help="Planner name to use as the greedy baseline for MCTS-vs-greedy analysis.",
+    )
+
     parser.add_argument(
         "--no-plots",
         action="store_true",
-        help="Run simulations and save CSV, but do not create PNG plots.",
+        help="Run simulations and save CSVs, but do not create PNG plots.",
     )
+
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue running other planners/seeds if one planner fails.",
+    )
+
     return parser.parse_args()
 
 
@@ -429,13 +1016,25 @@ def main() -> None:
         planners=planners,
         seeds=args.seeds,
         output_dir=output_dir,
+        continue_on_error=args.continue_on_error,
     )
 
     save_metrics_csv(metrics, output_dir / "summary_metrics.csv")
     print_aggregate_table(metrics)
 
+    analyze_mcts_vs_greedy(
+        metrics=metrics,
+        output_path=output_dir / "mcts_vs_greedy_analysis.csv",
+        greedy_name=args.greedy_name,
+    )
+
     if not args.no_plots:
-        make_all_plots(metrics, planners, args.seeds, output_dir)
+        make_all_plots(
+            metrics=metrics,
+            planners=planners,
+            seeds=args.seeds,
+            output_dir=output_dir,
+        )
 
 
 if __name__ == "__main__":

@@ -1,52 +1,38 @@
 """Greedy planner baselines for multi-target tracking simulations.
 
-Each planner exposes the same minimal interface expected by simulate_run.py:
+All greedy planners consume the standardized PlannerInput object.
 
-    choose_track(tracks, drone, targets, rng) -> int
-
-The planner returns the track_id that the drone should pursue next.
+This guarantees that greedy planners use the exact same valid action set as
+random, MCTS, warm MCTS, and guided MCTS.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
 
 import numpy as np
 
-from core.sim.drone import Drone
-from core.sim.target import TargetSet
-from core.sim.tracks import Track, TrackSet
+from core.planners.action_space import validate_action_or_raise
+from core.planners.planner_state import PlannerInput
+from core.sim.tracks import Track
 
 
-class PlannerProtocol(Protocol):
-    """Minimal planner interface used by the simulation runner."""
+def _valid_tracks_or_raise(
+    planner_input: PlannerInput,
+    planner_name: str,
+) -> list[Track]:
+    """Return selectable tracks using PlannerInput.valid_action_ids."""
 
-    def choose_track(
-        self,
-        tracks: TrackSet,
-        drone: Drone,
-        targets: TargetSet,
-        rng: np.random.Generator,
-    ) -> int:
-        """Return the selected track_id to pursue next."""
+    valid_actions = set(planner_input.require_valid_actions(planner_name))
 
-
-def _valid_tracks_or_raise(tracks: TrackSet, planner_name: str) -> list[Track]:
-    """Return active selectable tracks for a planner.
-
-    This relies on TrackSet.valid_action_ids() as the shared source of truth.
-    """
-
-    valid_actions = set(tracks.valid_action_ids())
     valid_tracks = [
         track
-        for track in tracks.tracks
+        for track in planner_input.tracks.tracks
         if int(track.track_id) in valid_actions
     ]
 
     if not valid_tracks:
-        raise ValueError(f"{planner_name} cannot choose from an empty valid action list.")
+        raise ValueError(f"{planner_name} cannot choose from an empty valid track list.")
 
     return valid_tracks
 
@@ -61,18 +47,24 @@ class GreedyUncertaintyPlanner:
 
     def choose_track(
         self,
-        tracks: TrackSet,
-        drone: Drone,
-        targets: TargetSet,
+        planner_input: PlannerInput,
         rng: np.random.Generator,
     ) -> int:
-        valid_tracks = _valid_tracks_or_raise(tracks, "GreedyUncertaintyPlanner")
+        valid_tracks = _valid_tracks_or_raise(
+            planner_input,
+            "GreedyUncertaintyPlanner",
+        )
 
         chosen = max(
             valid_tracks,
             key=lambda track: track.position_variance_trace,
         )
-        return int(chosen.track_id)
+
+        return validate_action_or_raise(
+            int(chosen.track_id),
+            planner_input.valid_action_ids,
+            planner_name="GreedyUncertaintyPlanner",
+        )
 
 
 @dataclass(slots=True)
@@ -85,18 +77,24 @@ class GreedyLogDetPlanner:
 
     def choose_track(
         self,
-        tracks: TrackSet,
-        drone: Drone,
-        targets: TargetSet,
+        planner_input: PlannerInput,
         rng: np.random.Generator,
     ) -> int:
-        valid_tracks = _valid_tracks_or_raise(tracks, "GreedyLogDetPlanner")
+        valid_tracks = _valid_tracks_or_raise(
+            planner_input,
+            "GreedyLogDetPlanner",
+        )
 
         chosen = max(
             valid_tracks,
             key=lambda track: track.position_uncertainty_logdet,
         )
-        return int(chosen.track_id)
+
+        return validate_action_or_raise(
+            int(chosen.track_id),
+            planner_input.valid_action_ids,
+            planner_name="GreedyLogDetPlanner",
+        )
 
 
 @dataclass(slots=True)
@@ -105,6 +103,8 @@ class GreedyDistanceAwarePlanner:
 
     Score:
         uncertainty / (travel_time + travel_time_bias)
+
+    This is not the full shared objective, but it now uses the shared action set.
     """
 
     travel_time_bias: float = 30.0
@@ -112,12 +112,15 @@ class GreedyDistanceAwarePlanner:
 
     def choose_track(
         self,
-        tracks: TrackSet,
-        drone: Drone,
-        targets: TargetSet,
+        planner_input: PlannerInput,
         rng: np.random.Generator,
     ) -> int:
-        valid_tracks = _valid_tracks_or_raise(tracks, "GreedyDistanceAwarePlanner")
+        valid_tracks = _valid_tracks_or_raise(
+            planner_input,
+            "GreedyDistanceAwarePlanner",
+        )
+
+        drone = planner_input.drone
 
         def score(track: Track) -> float:
             uncertainty = (
@@ -135,4 +138,65 @@ class GreedyDistanceAwarePlanner:
             return float(uncertainty / (travel_time + self.travel_time_bias))
 
         chosen = max(valid_tracks, key=score)
-        return int(chosen.track_id)
+
+        return validate_action_or_raise(
+            int(chosen.track_id),
+            planner_input.valid_action_ids,
+            planner_name="GreedyDistanceAwarePlanner",
+        )
+
+
+@dataclass(slots=True)
+class GreedySharedScorePlanner:
+    """Greedy one-step approximation of the shared objective.
+
+    This planner estimates the immediate desirability of a target using:
+    - uncertainty benefit
+    - travel-time penalty
+    - active valid action set
+
+    It is useful as a fair baseline against MCTS because it is closer to the same
+    kind of objective MCTS should optimize.
+    """
+
+    uncertainty_weight: float = 1.0
+    travel_time_weight: float = 1.0
+    travel_time_bias: float = 30.0
+    use_logdet: bool = False
+
+    def choose_track(
+        self,
+        planner_input: PlannerInput,
+        rng: np.random.Generator,
+    ) -> int:
+        valid_tracks = _valid_tracks_or_raise(
+            planner_input,
+            "GreedySharedScorePlanner",
+        )
+
+        drone = planner_input.drone
+
+        def score(track: Track) -> float:
+            uncertainty = (
+                track.position_uncertainty_logdet
+                if self.use_logdet
+                else track.position_variance_trace
+            )
+
+            if self.use_logdet:
+                uncertainty = max(1e-6, uncertainty + 50.0)
+
+            travel_time = drone.time_to(track.position)
+
+            return float(
+                self.uncertainty_weight * uncertainty
+                - self.travel_time_weight * (travel_time + self.travel_time_bias)
+            )
+
+        chosen = max(valid_tracks, key=score)
+
+        return validate_action_or_raise(
+            int(chosen.track_id),
+            planner_input.valid_action_ids,
+            planner_name="GreedySharedScorePlanner",
+        )

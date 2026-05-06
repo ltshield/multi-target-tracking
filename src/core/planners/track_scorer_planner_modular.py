@@ -10,7 +10,7 @@ from core.learning.track_scorer_model import TrackScorerNet
 
 
 class TrackScorerPlanner:
-    def __init__(self, model_path: str = "models/track_scorer.pt"):
+    def __init__(self, model_path: str = "models/track_scorer_imitation.pt"):
         checkpoint = torch.load(model_path, map_location="cpu")
 
         self.extractor = load_extractor(str(checkpoint["extractor"]))
