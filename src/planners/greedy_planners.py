@@ -16,7 +16,7 @@ import numpy as np
 
 from core.sim.drone import Drone
 from core.sim.target import TargetSet
-from tracks import Track, TrackSet
+from core.sim.tracks import Track, TrackSet
 
 
 class PlannerProtocol(Protocol):

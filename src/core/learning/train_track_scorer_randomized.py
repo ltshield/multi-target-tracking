@@ -34,7 +34,6 @@ from core.sim.scenario_sampler import ScenarioSamplerConfig, sample_random_scena
 from core.learning.track_feature_extractors import load_extractor, track_id_to_slot
 from core.learning.track_scorer_model import TrackScorerNet
 
-
 def collect_dataset(args):
     """Collect MCTS teacher demonstrations from randomized scenarios.
 

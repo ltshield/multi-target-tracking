@@ -6,8 +6,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from track_feature_extractors import load_extractor, slot_to_track_id
-from track_scorer_model import TrackScorerNet
+from core.learning.track_feature_extractors import load_extractor, slot_to_track_id
+from core.learning.track_scorer_model import TrackScorerNet
 
 
 class TrackScorerPlanner:
