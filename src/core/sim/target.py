@@ -77,6 +77,21 @@ class Target:
         """Current true scalar speed."""
 
         return float(np.linalg.norm(self.velocity))
+    
+    @property
+    def lost(self) -> bool:
+        """Whether this target is no longer searchable/moving."""
+        return not self.is_active
+
+    def mark_lost(self) -> None:
+        """Deactivate this ground-truth target.
+
+        Once lost, the target:
+        - stops moving
+        - is no longer returned by TargetSet.positions_dict(active_only=True)
+        - is no longer detectable by the drone
+        """
+        self.is_active = False
 
     def copy(self) -> "Target":
         """Return a simulation-safe copy of this target."""
@@ -109,7 +124,7 @@ class Target:
 
         self._validate_dt(dt)
 
-        if not self.is_active:
+        if self.lost:
             return self.state
 
         self.state = self.predict_state(dt)

@@ -151,6 +151,17 @@ class Track:
 
         det = max(self.position_uncertainty_det, 1e-12)
         return float(np.log(det))
+    
+    def reported_position_variance_trace(self, lost_target_penalty: float) -> float:
+        """Return the uncertainty value that should be reported in metrics.
+
+        Active tracks report their actual covariance trace.
+        Lost tracks report a fixed max penalty.
+        """
+        if self.is_lost:
+            return float(lost_target_penalty)
+
+        return float(self.position_variance_trace)
 
     def copy(self) -> "Track":
         copied = Track(
@@ -272,12 +283,27 @@ class Track:
             dtype=float,
         )
     
+    def mark_lost(self, current_time: float, reason: str) -> None:
+        """Mark this track as permanently lost.
+
+        Lost tracks are no longer selectable by planners, no longer updated by
+        detections, and no longer propagated by the Kalman prediction step.
+        """
+        if self.is_lost:
+            return
+
+        self.is_lost = True
+        self.lost_reason = reason
+        self.lost_time = float(current_time)
+        self.existence_probability = 0.0
+        
     def check_lost(
         self,
         current_time: float,
         max_position_trace: float | None = None,
         max_position_logdet: float | None = None,
         max_time_since_seen: float | None = None,
+        min_existence_probability: float | None = None,
     ) -> bool:
         """Mark this track as permanently lost if it exceeds loss thresholds.
 
@@ -287,25 +313,44 @@ class Track:
         if self.is_lost:
             return True
 
-        if max_position_trace is not None and self.position_variance_trace >= max_position_trace:
-            self.is_lost = True
-            self.lost_reason = "position_trace_threshold"
-            self.lost_time = current_time
-            self.existence_probability = 0.0
+        if (
+            max_position_trace is not None
+            and self.position_variance_trace >= max_position_trace
+        ):
+            self.mark_lost(
+                current_time=current_time,
+                reason="position_trace_threshold",
+            )
             return True
 
-        if max_position_logdet is not None and self.position_uncertainty_logdet >= max_position_logdet:
-            self.is_lost = True
-            self.lost_reason = "position_logdet_threshold"
-            self.lost_time = current_time
-            self.existence_probability = 0.0
+        if (
+            max_position_logdet is not None
+            and self.position_uncertainty_logdet >= max_position_logdet
+        ):
+            self.mark_lost(
+                current_time=current_time,
+                reason="position_logdet_threshold",
+            )
             return True
 
-        if max_time_since_seen is not None and self.time_since_seen >= max_time_since_seen:
-            self.is_lost = True
-            self.lost_reason = "time_since_seen_threshold"
-            self.lost_time = current_time
-            self.existence_probability = 0.0
+        if (
+            max_time_since_seen is not None
+            and self.time_since_seen >= max_time_since_seen
+        ):
+            self.mark_lost(
+                current_time=current_time,
+                reason="time_since_seen_threshold",
+            )
+            return True
+
+        if (
+            min_existence_probability is not None
+            and self.existence_probability <= min_existence_probability
+        ):
+            self.mark_lost(
+                current_time=current_time,
+                reason="existence_probability_threshold",
+            )
             return True
 
         return False
@@ -320,6 +365,10 @@ class TrackSet:
     @property
     def active_tracks(self) -> list[Track]:
         return [track for track in self.tracks if not track.is_lost]
+
+    def valid_action_ids(self) -> list[int]:
+        """Track IDs that planners are allowed to select."""
+        return [int(track.track_id) for track in self.active_tracks]
 
     def __post_init__(self) -> None:
         ids = [track.track_id for track in self.tracks]
@@ -393,11 +442,12 @@ class TrackSet:
         return sum(1 for track in self.tracks if not track.is_lost)
     
     def check_lost_tracks(
-    self,
-    current_time: float,
-    max_position_trace: float | None = None,
-    max_position_logdet: float | None = None,
-    max_time_since_seen: float | None = None,
+        self,
+        current_time: float,
+        max_position_trace: float | None = None,
+        max_position_logdet: float | None = None,
+        max_time_since_seen: float | None = None,
+        min_existence_probability: float | None = None,
     ) -> list[int]:
         """Mark tracks as lost if they exceed thresholds.
 
@@ -414,6 +464,7 @@ class TrackSet:
                 max_position_trace=max_position_trace,
                 max_position_logdet=max_position_logdet,
                 max_time_since_seen=max_time_since_seen,
+                min_existence_probability=min_existence_probability,
             )
 
             if not was_lost and track.is_lost:

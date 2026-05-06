@@ -406,12 +406,24 @@ class MCTSPlanner:
         return belief.position_trace >= self.lost_trace_threshold
 
     def _rollout_policy(self, state: PlanningState, drone: Drone, rng: np.random.Generator) -> int:
-        actions = list(state.available_actions) or list(state.beliefs.keys())
+        actions = [
+            int(action)
+            for action in state.available_actions
+            if not self._belief_is_lost(state.beliefs[int(action)])
+        ]
+
+        if not actions:
+            raise RuntimeError("MCTS rollout policy received no available active actions.")
 
         if rng.random() < self.rollout_random_action_probability:
             return int(rng.choice(actions))
 
-        return int(max(actions, key=lambda action: self._heuristic_action_score(state, action, drone)))
+        return int(
+            max(
+                actions,
+                key=lambda action: self._heuristic_action_score(state, action, drone),
+            )
+        )
 
     def _heuristic_action_score(self, state: PlanningState, action: int, drone: Drone) -> float:
         b = state.beliefs[action]
@@ -584,13 +596,12 @@ class MCTSPlanner:
 
     @staticmethod
     def _active_candidate_tracks(tracks: TrackSet) -> list[Track]:
-        candidates = []
-        for track in tracks.tracks:
-            # Compatible with both pre-loss and post-loss Track implementations.
-            if getattr(track, "is_lost", False):
-                continue
-            candidates.append(track)
-        return candidates
+        valid_actions = set(tracks.valid_action_ids())
+        return [
+            track
+            for track in tracks.tracks
+            if int(track.track_id) in valid_actions
+        ]
 
     @staticmethod
     def _travel_time(start: np.ndarray, goal: np.ndarray, speed: float) -> float:

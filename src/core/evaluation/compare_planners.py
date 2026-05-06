@@ -166,6 +166,7 @@ def summarize_run(run: dict[str, Any]) -> dict[str, Any]:
 
     final_frame = history[-1]
     final_drone = final_frame["drone"]
+    final_metrics = final_frame["metrics"]
 
     return {
         "final_time": float(final_frame["time"]),
@@ -190,6 +191,8 @@ def summarize_run(run: dict[str, Any]) -> dict[str, Any]:
         "final_uncertainty_logdet": float(logdets[-1]),
         "avg_uncertainty_logdet": float(np.mean(logdets)),
         "auc_uncertainty_logdet": area_under_curve(times, logdets),
+        "final_num_lost": int(final_metrics.get("num_lost", 0)),
+        "final_num_active": int(final_metrics.get("num_active", 0)),
         "distance_traveled": float(final_drone["distance_traveled"]),
         "selected_track_sequence": "-".join(str(x) for x in selected_tracks if x is not None),
     }
@@ -228,6 +231,7 @@ def print_aggregate_table(metrics: list[dict[str, Any]]) -> None:
         "avg_uncertainty_trace",
         "auc_uncertainty_trace",
         "num_detections",
+        "final_num_lost",
         "distance_traveled",
     ]
 

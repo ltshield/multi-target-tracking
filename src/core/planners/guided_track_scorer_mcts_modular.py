@@ -160,6 +160,12 @@ class GuidedTrackScorerMCTSPlanner(MCTSPlanner):
             max_tracks=self.max_tracks,
         )
 
+        valid_actions = set(int(a) for a in state.available_actions)
+
+        for i, track_id in enumerate(batch.track_ids):
+            if int(track_id) not in valid_actions:
+                batch.action_mask[i] = False
+
         if not np.any(batch.action_mask):
             self._last_prior_cache_key = cache_key
             self._last_prior_by_track_id = {}
@@ -213,13 +219,20 @@ class _FakeDrone:
 
 
 class _FakeTrackSet:
-    """Minimal TrackSet-like object for feature extraction from MCTS beliefs."""
+    """Minimal TrackSet-like object for feature extraction from an MCTS state."""
 
     def __init__(self, beliefs: dict[int, Any], lost_threshold: float):
         self.tracks = [
             _FakeTrack(belief=belief, lost_threshold=lost_threshold)
             for belief in beliefs.values()
         ]
+
+    @property
+    def active_tracks(self) -> list["_FakeTrack"]:
+        return [track for track in self.tracks if not track.is_lost]
+
+    def valid_action_ids(self) -> list[int]:
+        return [int(track.track_id) for track in self.active_tracks]
 
 
 class _FakeTrack:

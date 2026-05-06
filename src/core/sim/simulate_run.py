@@ -68,7 +68,12 @@ class RandomPlanner:
         targets: TargetSet,
         rng: np.random.Generator,
     ) -> int:
-        return int(rng.choice([track.track_id for track in tracks.tracks]))
+        valid_actions = tracks.valid_action_ids()
+
+        if not valid_actions:
+            raise RuntimeError("RandomPlanner received no valid actions.")
+
+        return int(rng.choice(valid_actions))
 
 
 class Mode(Enum):
@@ -91,6 +96,7 @@ class SimConfig:
     max_position_trace_before_lost: float | None = 250000.0
     max_position_logdet_before_lost: float | None = None
     max_time_since_seen_before_lost: float | None = None
+    min_existence_probability_before_lost: float | None = None
     lost_target_penalty: float = 1000000.0
 
     drone_initial_position: list[float] = field(default_factory=lambda: [0.0, 0.0])
@@ -149,6 +155,9 @@ def load_config_from_yaml(path: Path) -> SimConfig:
         ),
         max_time_since_seen_before_lost=loss.get(
             "max_time_since_seen_before_lost", None
+        ),
+        min_existence_probability_before_lost=loss.get(
+            "min_existence_probability_before_lost", None
         ),
         lost_target_penalty=float(loss.get("lost_target_penalty", 1000000.0)),
         targets=raw.get("targets", []),
@@ -239,15 +248,18 @@ class SimulationState:
         """
 
         available_tracks = self.available_tracks_for_planning()
-        if len(available_tracks.tracks) == 0:
+        valid_actions = available_tracks.valid_action_ids()
+
+        if not valid_actions:
             self.mode = Mode.DONE
             self.log_frame(event="all_targets_lost")
             return
 
         selected_id: int | None = None
 
-        if self.planned_next_track_id is not None and self.track_is_active(
-            self.planned_next_track_id
+        if (
+            self.planned_next_track_id is not None
+            and int(self.planned_next_track_id) in valid_actions
         ):
             selected_id = int(self.planned_next_track_id)
 
@@ -265,16 +277,9 @@ class SimulationState:
                 )
             )
 
-        if not self.track_is_active(selected_id):
-            # Robust fallback if a planner returns a stale/lost track.
-            selected_id = int(
-                self.planner.choose_track(
-                    tracks=available_tracks,
-                    drone=self.drone,
-                    targets=self.targets,
-                    rng=self.rng,
-                )
-            )
+        if selected_id not in valid_actions:
+            # Hard safety fallback: no planner is allowed to select a lost target.
+            selected_id = int(valid_actions[0])
 
         self.selected_track_id = int(selected_id)
         selected_track = self.tracks[self.selected_track_id]
@@ -434,8 +439,12 @@ class SimulationState:
         if dt <= 0.0:
             return
 
+        # Move only active ground-truth targets.
+        # Target.step() handles the active/lost check internally.
         self.targets.step(dt, add_noise=True)
 
+        # Predict only active belief tracks.
+        # TrackSet.predict_all() skips lost tracks internally.
         self.tracks.predict_all(
             dt=dt,
             acceleration_noise_std=self.config.acceleration_noise_std,
@@ -447,9 +456,19 @@ class SimulationState:
             max_position_trace=self.config.max_position_trace_before_lost,
             max_position_logdet=self.config.max_position_logdet_before_lost,
             max_time_since_seen=self.config.max_time_since_seen_before_lost,
+            min_existence_probability=self.config.min_existence_probability_before_lost,
         )
+
         if newly_lost:
             self.newly_lost_tracks = newly_lost
+
+            # Important: when the belief track is lost, deactivate the corresponding
+            # true target so it stops moving and stops being detectable.
+            for track_id in newly_lost:
+                try:
+                    self.targets[track_id].mark_lost()
+                except KeyError:
+                    pass
 
     def detect_and_update_tracks(self):
         raw_detections = self.drone.detect_targets(self.targets.positions_dict())
@@ -545,6 +564,11 @@ class SimulationState:
                     "lost_reason": track.lost_reason,
                     "lost_time": track.lost_time,
                     "position_variance_trace": float(track.position_variance_trace),
+                    "reported_position_variance_trace": float(
+                        track.reported_position_variance_trace(
+                            self.config.lost_target_penalty
+                        )
+                    ),
                     "position_uncertainty_logdet": float(
                         track.position_uncertainty_logdet
                     ),

@@ -1,4 +1,4 @@
-"""Planner baselines for multi-target tracking simulations.
+"""Greedy planner baselines for multi-target tracking simulations.
 
 Each planner exposes the same minimal interface expected by simulate_run.py:
 
@@ -32,38 +32,31 @@ class PlannerProtocol(Protocol):
         """Return the selected track_id to pursue next."""
 
 
-@dataclass(slots=True)
-class RandomPlanner:
-    """Baseline planner that randomly selects one track.
+def _valid_tracks_or_raise(tracks: TrackSet, planner_name: str) -> list[Track]:
+    """Return active selectable tracks for a planner.
 
-    This is useful as a sanity-check lower baseline. It should usually perform
-    worse than greedy/MCTS over long runs, but it is very helpful for testing the
-    simulator pipeline.
+    This relies on TrackSet.valid_action_ids() as the shared source of truth.
     """
 
-    def choose_track(
-        self,
-        tracks: TrackSet,
-        drone: Drone,
-        targets: TargetSet,
-        rng: np.random.Generator,
-    ) -> int:
-        if len(tracks.tracks) == 0:
-            raise ValueError("RandomPlanner cannot choose from an empty TrackSet.")
+    valid_actions = set(tracks.valid_action_ids())
+    valid_tracks = [
+        track
+        for track in tracks.tracks
+        if int(track.track_id) in valid_actions
+    ]
 
-        return int(rng.choice([track.track_id for track in tracks.tracks]))
+    if not valid_tracks:
+        raise ValueError(f"{planner_name} cannot choose from an empty valid action list.")
+
+    return valid_tracks
 
 
 @dataclass(slots=True)
 class GreedyUncertaintyPlanner:
-    """Greedy planner that pursues the most uncertain track.
+    """Greedy planner that pursues the most uncertain active track.
 
     Score:
         position covariance trace = sigma_xx + sigma_yy
-
-    This ignores travel time, target speed, and expected probability of detection.
-    It simply asks: "Which target's position belief is currently the most spread
-    out?" Then it sends the drone there.
     """
 
     def choose_track(
@@ -73,11 +66,10 @@ class GreedyUncertaintyPlanner:
         targets: TargetSet,
         rng: np.random.Generator,
     ) -> int:
-        if len(tracks.tracks) == 0:
-            raise ValueError("GreedyUncertaintyPlanner cannot choose from an empty TrackSet.")
+        valid_tracks = _valid_tracks_or_raise(tracks, "GreedyUncertaintyPlanner")
 
         chosen = max(
-            tracks.tracks,
+            valid_tracks,
             key=lambda track: track.position_variance_trace,
         )
         return int(chosen.track_id)
@@ -85,13 +77,10 @@ class GreedyUncertaintyPlanner:
 
 @dataclass(slots=True)
 class GreedyLogDetPlanner:
-    """Greedy planner that pursues the track with largest log-det uncertainty.
+    """Greedy planner that pursues the active track with largest log-det uncertainty.
 
     Score:
         log(det(position covariance))
-
-    This is closer to the uncertainty metric used in the paper, which measures
-    final uncertainty using log(det(Sigma_xy)) across targets.
     """
 
     def choose_track(
@@ -101,11 +90,10 @@ class GreedyLogDetPlanner:
         targets: TargetSet,
         rng: np.random.Generator,
     ) -> int:
-        if len(tracks.tracks) == 0:
-            raise ValueError("GreedyLogDetPlanner cannot choose from an empty TrackSet.")
+        valid_tracks = _valid_tracks_or_raise(tracks, "GreedyLogDetPlanner")
 
         chosen = max(
-            tracks.tracks,
+            valid_tracks,
             key=lambda track: track.position_uncertainty_logdet,
         )
         return int(chosen.track_id)
@@ -117,10 +105,6 @@ class GreedyDistanceAwarePlanner:
 
     Score:
         uncertainty / (travel_time + travel_time_bias)
-
-    This prevents the drone from always chasing a very uncertain target that is
-    extremely far away if another highly uncertain target is nearby. This is not
-    MCTS, but it is often a stronger heuristic baseline than pure uncertainty.
     """
 
     travel_time_bias: float = 30.0
@@ -133,8 +117,7 @@ class GreedyDistanceAwarePlanner:
         targets: TargetSet,
         rng: np.random.Generator,
     ) -> int:
-        if len(tracks.tracks) == 0:
-            raise ValueError("GreedyDistanceAwarePlanner cannot choose from an empty TrackSet.")
+        valid_tracks = _valid_tracks_or_raise(tracks, "GreedyDistanceAwarePlanner")
 
         def score(track: Track) -> float:
             uncertainty = (
@@ -144,12 +127,12 @@ class GreedyDistanceAwarePlanner:
             )
 
             # If using log-det, values can be negative for tiny covariance.
-            # Shift into a positive-ish range so division behaves sanely.
+            # Shift into a positive range so division behaves sanely.
             if self.use_logdet:
                 uncertainty = max(1e-6, uncertainty + 50.0)
 
             travel_time = drone.time_to(track.position)
             return float(uncertainty / (travel_time + self.travel_time_bias))
 
-        chosen = max(tracks.tracks, key=score)
+        chosen = max(valid_tracks, key=score)
         return int(chosen.track_id)

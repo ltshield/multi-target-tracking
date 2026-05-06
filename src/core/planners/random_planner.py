@@ -1,4 +1,4 @@
-"""Planner baselines for multi-target tracking simulations.
+"""Random planner baseline for multi-target tracking simulations.
 
 Each planner exposes the same minimal interface expected by simulate_run.py:
 
@@ -16,7 +16,7 @@ import numpy as np
 
 from core.sim.drone import Drone
 from core.sim.target import TargetSet
-from core.sim.tracks import Track, TrackSet
+from core.sim.tracks import TrackSet
 
 
 class PlannerProtocol(Protocol):
@@ -34,12 +34,7 @@ class PlannerProtocol(Protocol):
 
 @dataclass(slots=True)
 class RandomPlanner:
-    """Baseline planner that randomly selects one track.
-
-    This is useful as a sanity-check lower baseline. It should usually perform
-    worse than greedy/MCTS over long runs, but it is very helpful for testing the
-    simulator pipeline.
-    """
+    """Baseline planner that randomly selects one valid active track."""
 
     def choose_track(
         self,
@@ -48,7 +43,9 @@ class RandomPlanner:
         targets: TargetSet,
         rng: np.random.Generator,
     ) -> int:
-        if len(tracks.tracks) == 0:
-            raise ValueError("RandomPlanner cannot choose from an empty TrackSet.")
+        valid_actions = tracks.valid_action_ids()
 
-        return int(rng.choice([track.track_id for track in tracks.tracks]))
+        if not valid_actions:
+            raise ValueError("RandomPlanner cannot choose from an empty valid action list.")
+
+        return int(rng.choice(valid_actions))
