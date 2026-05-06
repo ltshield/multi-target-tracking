@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from core.sim.simulate_run import load_config_from_yaml
 from core.learning.mtt_gym_env import MTTTargetSelectionEnv
-from planners.mcts_planner_realtime import MCTSPlanner
+from core.planners.mcts_planner_realtime import MCTSPlanner
 from core.sim.scenario_sampler import ScenarioSamplerConfig, sample_random_scenario
 from core.learning.track_feature_extractors import load_extractor, track_id_to_slot
 from core.learning.track_scorer_model import TrackScorerNet

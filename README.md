@@ -682,53 +682,21 @@ The commands below assume you are running from the project root.
 
 On Windows PowerShell, use `^` for line continuation. On Mac/Linux, replace `^` with `\`.
 
+Set this for import errors: $env:PYTHONPATH = (Resolve-Path .\src).Path
+
+**NOTE: some of these commands were not 
+
 ---
 
 ### 8.1 Run one simulation
 
-Random planner:
+Ex:
 
 ```bash
 python src/core/simulate_run.py ^
   --config configs/basic_3target.yaml ^
-  --planner random_planner.RandomPlanner ^
+  --planner core.planners.planner.Planner ^
   --output runs/random_test.json
-```
-
-Greedy planner:
-
-```bash
-python src/core/simulate_run.py ^
-  --config configs/basic_3target.yaml ^
-  --planner greedy_planners.GreedyDistanceAwarePlanner ^
-  --output runs/greedy_test.json
-```
-
-Realtime MCTS:
-
-```bash
-python src/core/simulate_run.py ^
-  --config configs/basic_3target.yaml ^
-  --planner mcts_planner_realtime.MCTSPlanner ^
-  --output runs/mcts_test.json
-```
-
-Neural scorer:
-
-```bash
-python src/core/simulate_run.py ^
-  --config configs/basic_3target.yaml ^
-  --planner track_scorer_planner_modular.TrackScorerPlanner ^
-  --output runs/scorer_test.json
-```
-
-Guided MCTS:
-
-```bash
-python src/core/simulate_run.py ^
-  --config configs/basic_3target.yaml ^
-  --planner guided_track_scorer_mcts_modular.GuidedTrackScorerMCTSPlanner ^
-  --output runs/guided_test.json
 ```
 
 ---
@@ -736,8 +704,7 @@ python src/core/simulate_run.py ^
 ### 8.2 Visualize a run
 
 ```bash
-python src/core/visualize_run_pygame.py ^
-  --input runs/mcts_test.json
+python src/core/visualization/pygame_visualize_run.py --input runs/track_scorer_compare/guided_seed7.json
 ```
 
 Controls:
@@ -757,21 +724,7 @@ ESC    quit
 ### 8.3 Compare planners
 
 ```bash
-python src/core/compare_planners.py ^
-  --config configs/basic_3target.yaml ^
-  --output-dir runs/planner_compare ^
-  --seeds 7 8 9 10 11 ^
-  --planners random=random_planner.RandomPlanner greedy=greedy_planners.GreedyDistanceAwarePlanner mcts=mcts_planner_realtime.MCTSPlanner
-```
-
-Compare all major planners:
-
-```bash
-python src/core/compare_planners.py ^
-  --config configs/basic_3target.yaml ^
-  --output-dir runs/full_compare ^
-  --seeds 7 8 9 10 11 ^
-  --planners random=random_planner.RandomPlanner greedy=greedy_planners.GreedyDistanceAwarePlanner mcts=mcts_planner_realtime.MCTSPlanner scorer=track_scorer_planner_modular.TrackScorerPlanner guided=guided_track_scorer_mcts_modular.GuidedTrackScorerMCTSPlanner
+python src/core/evaluation/compare_planners.py --config configs/basic_3target.yaml --output-dir runs/full_compare --seeds 7 8 9 10 11 --planners random=core.planners.random_planner.RandomPlanner greedy=core.planners.greedy_planners.GreedyDistanceAwarePlanner mcts=core.planners.mcts_planner_realtime.MCTSPlanner scorer=core.planners.track_scorer_planner_modular.TrackScorerPlanner guided=core.planners.guided_track_scorer_mcts_modular.GuidedTrackScorerMCTSPlanner
 ```
 
 ---
@@ -781,7 +734,7 @@ python src/core/compare_planners.py ^
 Quick smoke test:
 
 ```bash
-python src/core/train_track_scorer_randomized.py ^
+python src/core/learning/train_track_scorer_randomized.py ^
   --base-config configs/basic_3target.yaml ^
   --dataset data/randomized_track_scorer_demos_test.npz ^
   --model-output models/track_scorer_test.pt ^
@@ -795,7 +748,7 @@ python src/core/train_track_scorer_randomized.py ^
 Serious run:
 
 ```bash
-python src/core/train_track_scorer_randomized.py ^
+python src/core/learning/train_track_scorer_randomized.py ^
   --base-config configs/basic_3target.yaml ^
   --dataset data/randomized_track_scorer_demos.npz ^
   --model-output models/track_scorer.pt ^
@@ -861,30 +814,21 @@ episode=0008 targets=6 episode_samples=14 total_kept_samples=92 final_metric=200
 ### Step 1: Verify simulation works
 
 ```bash
-python src/core/simulate_run.py ^
+python src/core/sim/simulate_run.py ^
   --config configs/basic_3target.yaml ^
-  --planner greedy_planners.GreedyDistanceAwarePlanner ^
+  --planner core.planners.greedy_planners.GreedyDistanceAwarePlanner ^
   --output runs/greedy_smoke.json
 ```
 
 Visualize:
 
 ```bash
-python src/core/pygame_visualize_run.py ^
-  --input runs/greedy_smoke.json
+python src/core/visualization/pygame_visualize_run.py --input runs/greedy_smoke.json
 ```
 
 ---
 
-### Step 2: Compare baseline planners
-
-```bash
-python src/core/compare_planners.py ^
-  --config configs/basic_3target.yaml ^
-  --output-dir runs/baseline_compare ^
-  --seeds 7 8 9 10 11 ^
-  --planners random=random_planner.RandomPlanner greedy=greedy_planners.GreedyDistanceAwarePlanner mcts=mcts_planner_realtime.MCTSPlanner
-```
+### Step 2: Compare baseline planners using code above
 
 ---
 
@@ -916,18 +860,6 @@ python src/core/train_track_scorer_randomized.py ^
   --epochs 60 ^
   --extractor polar ^
   --max-lost-for-keep 0
-```
-
----
-
-### Step 4: Compare learned planners
-
-```bash
-python src/core/compare_planners.py ^
-  --config configs/basic_3target.yaml ^
-  --output-dir runs/learned_compare ^
-  --seeds 7 8 9 10 11 ^
-  --planners greedy=greedy_planners.GreedyDistanceAwarePlanner mcts=mcts_planner_realtime.MCTSPlanner scorer=track_scorer_planner_modular.TrackScorerPlanner guided=guided_track_scorer_mcts_modular.GuidedTrackScorerMCTSPlanner
 ```
 
 ---

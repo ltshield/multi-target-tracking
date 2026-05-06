@@ -43,9 +43,17 @@ def load_extractor(path: str):
     """Load extractor class from module.Class string or common short name."""
 
     aliases = {
-        "cartesian": "track_feature_extractors.CartesianTrackFeatureExtractor",
-        "polar": "track_feature_extractors.PolarTrackFeatureExtractor",
-    }
+        "cartesian": "core.learning.track_feature_extractors.CartesianTrackFeatureExtractor",
+        "polar": "core.learning.track_feature_extractors.PolarTrackFeatureExtractor",
+
+        # Backward compatibility with old checkpoints before package reorganization.
+        "track_feature_extractors.CartesianTrackFeatureExtractor": (
+            "core.learning.track_feature_extractors.CartesianTrackFeatureExtractor"
+        ),
+        "track_feature_extractors.PolarTrackFeatureExtractor": (
+            "core.learning.track_feature_extractors.PolarTrackFeatureExtractor"
+        ),
+    }  
     path = aliases.get(path, path)
 
     module_name, class_name = path.rsplit(".", 1)
