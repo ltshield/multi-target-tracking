@@ -17,8 +17,8 @@ The generated tensors are compatible with TrackScorerNet.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -60,6 +60,7 @@ class ImitationLogger:
     extractor_name: str = "cartesian"
     max_tracks: int = 6
     examples: list[ImitationExample] = field(default_factory=list)
+    extractor: Any = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.extractor = load_extractor(self.extractor_name)
