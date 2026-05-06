@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+conda-meta/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Generated simulation outputs
+runs/
+*.png
+summary_metrics.csv
+
+# Training data
+data/**/*.npz
+data/**/*.npy
+data/demos/
+data/processed/
+
+# Trained models/checkpoints
+models/**/*.pt
+models/**/*.pth
+models/**/*.zip
+models/checkpoints/
+
+# Large artifacts / temporary files
+artifacts/
+outputs/
+tmp/
+temp/
+
+# Pygame / local debug captures
+screenshots/
+
+# Secrets/config overrides
+.env
+.env.*
+config.local.yaml
+configs/local/
