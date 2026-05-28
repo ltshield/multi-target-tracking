@@ -1,0 +1,136 @@
+# Three-target base scenario for testing whether MCTS gains value from lookahead.
+# Designed to work with mission_time_mobility_sweep.yaml, whose paths expect:
+#   simulation.mission_time
+#   drone.remaining_budget
+#   drone.speed
+#   targets.speed
+#   seed
+#
+# The sweep script will overwrite mission time, drone speed, target speed, and seed.
+# Keep this file as the structural base scenario.
+
+name: three_target_lookahead_base
+seed: 0
+
+simulation:
+  dt: 1.0
+  mission_time: 1200.0
+  world_size:
+    x_min: -1500.0
+    x_max: 1500.0
+    y_min: -1500.0
+    y_max: 1500.0
+
+  # Optional aliases used by some simulation runners.
+  max_time: 1200.0
+  decision_interval: 1.0
+
+# UAV starts near target 0, but target 1 and target 2 become important if ignored.
+# This creates a simple sequencing problem where greedy may over-service the nearby target.
+drone:
+  start_position: [0.0, 0.0]
+  position: [0.0, 0.0]
+  speed: 25.0
+  remaining_budget: 1200.0
+  sensor_range: 75.0
+
+tracks:
+  initial_position_variance: 25.0
+  initial_velocity_variance: 0.25
+  acceleration_noise_std: 0.03
+  lost_threshold_seconds: 240.0
+  lost_uncertainty_trace_threshold: 1000000.0
+  remove_lost_from_valid_actions: false
+
+  initial_tracks:
+    # Nearby/easy target. Greedy is tempted to keep this clean.
+    - track_id: 0
+      mean: [250.0, 0.0, 8.0, 0.0]
+      covariance_diag: [25.0, 25.0, 0.25, 0.25]
+      existence_probability: 1.0
+      time_since_seen: 0.0
+
+    # Farther target moving away. Should reward planning ahead.
+    - track_id: 1
+      mean: [850.0, 350.0, 10.0, 3.0]
+      covariance_diag: [100.0, 100.0, 0.5, 0.5]
+      existence_probability: 1.0
+      time_since_seen: 45.0
+
+    # Opposite-side target. Creates routing conflict with target 1.
+    - track_id: 2
+      mean: [-800.0, -450.0, -7.0, -5.0]
+      covariance_diag: [100.0, 100.0, 0.5, 0.5]
+      existence_probability: 1.0
+      time_since_seen: 45.0
+
+# TargetSet-style fields. The sweep script overwrites targets.speed.
+# If your simulator uses per-target velocities from tracks.initial_tracks, this speed
+# is still useful as a scenario-level parameter for generated random/constant-speed targets.
+targets:
+  count: 3
+  speed: 10.0
+  motion_model: constant_velocity
+  use_initial_tracks_as_truth: true
+  initial_targets:
+    - target_id: 0
+      position: [250.0, 0.0]
+      velocity: [8.0, 0.0]
+    - target_id: 1
+      position: [850.0, 350.0]
+      velocity: [10.0, 3.0]
+    - target_id: 2
+      position: [-800.0, -450.0]
+      velocity: [-7.0, -5.0]
+
+planners:
+  greedy:
+    class_path: core.planners.greedy_distance_aware.GreedyDistanceAwarePlanner
+    params: {}
+
+  mcts:
+    class_path: core.planners.mcts_expected_reduction_greedy_rollout.LegacyDebugMDPMCTSPlanner
+    params:
+      iterations: 1000
+      max_depth: 6
+      exploration_weight: 2.0
+      min_root_visits_per_action: 20
+      min_child_visits_per_action: 2
+
+      # Key experimental change: after each candidate first action,
+      # rollouts use the same distance-aware greedy logic.
+      rollout_policy: distance_aware_greedy
+      rollout_random_action_probability: 0.0
+
+      # Objective/value settings.
+      uncertainty_cost_mode: trace
+      use_reward_rate: true
+      min_reward_elapsed: 1.0
+      terminal_uncertainty_weight: 0.0
+      include_terminal_cost_in_value: true
+
+      # Internal model settings.
+      max_search_time: 65.0
+      acceleration_noise_std: 0.03
+      covariance_scale_for_detection: 1.0
+      use_intercept_time: true
+
+      # Detection/reset covariance.
+      reset_position_variance: 400.0
+      reset_velocity_variance: 0.005
+
+      remove_missed_target_from_branch: false
+      prevent_immediate_reselect_after_find: false
+      debug_print_root: false
+
+metrics:
+  record_uncertainty_trace: true
+  record_auc_uncertainty_trace: true
+  record_num_lost: true
+  record_num_detections: true
+  record_distance_traveled: true
+  record_runtime_seconds: true
+
+output:
+  save_traces: true
+  save_summary_csv: true

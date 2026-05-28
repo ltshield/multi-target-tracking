@@ -1,49 +1,42 @@
-"""Run multiple planners, save each run, and compare performance metrics.
+"""Run multiple planners and compare them using objective-aligned metrics.
 
-This expanded comparison script supports:
+This script is intended for comparing greedy, MCTS, warm MCTS, guided MCTS,
+legacy/reference-style MCTS, and related planners across the same seeds.
 
-- Running random, greedy, MCTS, warm MCTS, and guided MCTS across many seeds.
-- Saving each full simulation run as JSON.
-- Collecting key scalar metrics:
-    average uncertainty
-    final uncertainty
-    AUC uncertainty
-    number of lost targets
-    number of detections
-    distance traveled
-    number of decisions
-    runtime
-- Generating plots:
-    uncertainty over time
-    active/lost targets over time
-    target selected over time
-    UAV trajectory
-    target trajectories
-    final metric bar charts
-- Comparing MCTS-style planners against greedy:
-    where MCTS beats greedy
-    where long-term planning appears to matter
-    where greedy may be over-focusing on nearby targets
+Why this version exists
+-----------------------
+The reference/professor-style MCTS backs up negative terminal uncertainty. If we
+judge it only by raw AUC or by a simple frame-average uncertainty, we may be
+answering the wrong question. This script reports separate metric families:
 
-Example from project root:
+1. Reference-replication metrics
+   These answer: "Did this planner behave like the reference MCTS objective?"
+   Primary metric: final_uncertainty_trace.
 
-    python src/core/evaluation/compare_planners.py \
-        --config configs/basic_3target.yaml \
-        --output-dir runs/comparison_basic \
-        --seeds 7 8 9 10 11
+2. Tracking-quality metrics
+   These answer: "Was tracking quality better over time?"
+   Primary metric: normalized_auc_uncertainty_trace, which is
+   integral(trace dt) / mission_duration.
 
-Example with explicit planners:
+3. Balanced metrics
+   These answer: "Did it improve final uncertainty and time-average uncertainty
+   without losing more targets?"
 
+Important distinction
+---------------------
+- avg_uncertainty_trace is a frame average. It can be biased if planners create
+  different numbers/timing of logged frames.
+- normalized_auc_uncertainty_trace is the fair continuous-time average. Prefer
+  this for comparing average tracking quality.
+
+Example:
     python src/core/evaluation/compare_planners.py \
         --config configs/basic_3target.yaml \
         --output-dir runs/comparison_basic \
         --seeds 7 8 9 \
         --planners \
-            random=core.planners.random_planner.RandomPlanner \
             greedy=core.planners.greedy_planners.GreedyDistanceAwarePlanner \
-            mcts=core.planners.mcts_planner.MCTSPlanner \
-            warm_mcts=core.planners.warm_mcts_planner.WarmMCTSPlanner \
-            guided_mcts=core.planners.guided_track_scorer_mcts_modular.GuidedTrackScorerMCTSPlanner
+            legacy_mcts=core.planners.mcts_legacy_dwell_planner.LegacyDwellMDPMCTSPlanner
 """
 
 from __future__ import annotations
@@ -83,6 +76,10 @@ MCTS_LIKE_PLANNERS = {
     "warm_mcts",
     "guided_mcts",
     "realtime_mcts",
+    "legacy_mcts",
+    "legacy_dwell_mcts",
+    "reference_mcts",
+    "mdp_mcts",
 }
 
 
@@ -97,7 +94,7 @@ def run_planner_once(
     seed: int,
     output_dir: Path,
 ) -> dict[str, Any]:
-    """Run one planner on one seed, save JSON, and return metrics."""
+    """Run one planner on one seed, save JSON, and return scalar metrics."""
 
     config = replace(base_config, seed=seed)
     planner = load_planner(planner_path)
@@ -177,9 +174,10 @@ def run_comparison(
             all_metrics.append(metrics)
             print(
                 f"    final_trace={metrics['final_uncertainty_trace']:.2f} "
-                f"avg_trace={metrics['avg_uncertainty_trace']:.2f} "
-                f"auc={metrics['auc_uncertainty_trace']:.2f} "
+                f"norm_auc_trace={metrics['normalized_auc_uncertainty_trace']:.2f} "
+                f"frame_avg_trace={metrics['avg_uncertainty_trace']:.2f} "
                 f"lost={metrics['final_num_lost']} "
+                f"norm_lost={metrics['normalized_auc_num_lost']:.2f} "
                 f"detections={metrics['num_detections']} "
                 f"decisions={metrics['num_decisions']} "
                 f"distance={metrics['distance_traveled']:.2f} "
@@ -194,110 +192,163 @@ def run_comparison(
 # ---------------------------------------------------------------------------
 
 def summarize_run(run: dict[str, Any]) -> dict[str, Any]:
-    """Compute scalar metrics from one saved run dictionary."""
+    """Compute scalar metrics from one saved run dictionary.
+
+    The two main uncertainty metrics are:
+
+    - final_uncertainty_trace: matches a terminal-uncertainty MCTS objective.
+    - normalized_auc_uncertainty_trace: fair continuous-time average uncertainty.
+
+    avg_uncertainty_trace is retained as a diagnostic only because it is a mean
+    over frames rather than a time-weighted mean.
+    """
 
     history = run["history"]
     if not history:
         raise ValueError("Run has empty history.")
 
     times = np.array([frame["time"] for frame in history], dtype=float)
+    mission_duration = float(max(1e-9, times[-1] - times[0]))
 
     traces = np.array(
         [frame["metrics"]["total_position_trace"] for frame in history],
         dtype=float,
     )
-
     active_traces = np.array(
         [frame["metrics"].get("active_position_trace", np.nan) for frame in history],
         dtype=float,
     )
-
     logdets = np.array(
         [frame["metrics"]["total_position_logdet"] for frame in history],
         dtype=float,
     )
-
     num_lost_series = np.array(
         [frame["metrics"].get("num_lost", 0) for frame in history],
         dtype=float,
     )
-
     num_active_series = np.array(
         [frame["metrics"].get("num_active", 0) for frame in history],
         dtype=float,
     )
 
     detection_events = [frame for frame in history if frame.get("detections")]
-
     selected_tracks = [
         frame.get("selected_track_id")
         for frame in history
         if frame.get("event") == "choose_target"
     ]
-
-    selected_track_sequence = "-".join(
-        str(x) for x in selected_tracks if x is not None
-    )
+    selected_track_sequence = "-".join(str(x) for x in selected_tracks if x is not None)
 
     final_frame = history[-1]
+    first_frame = history[0]
     final_drone = final_frame["drone"]
     final_metrics = final_frame["metrics"]
+    first_metrics = first_frame.get("metrics", {})
 
-    unique_selected_targets = {
-        int(x) for x in selected_tracks if x is not None
-    }
-
+    unique_selected_targets = {int(x) for x in selected_tracks if x is not None}
     unique_detected_targets = {
         int(target_id)
         for frame in history
         for target_id in frame.get("detections", [])
     }
+    target_ids_seen = {
+        int(target_id)
+        for frame in history
+        for target_id in frame.get("targets", {}).keys()
+    }
+
+    initial_target_count = int(
+        max(
+            1,
+            len(target_ids_seen),
+            int(first_metrics.get("num_active", 0)) + int(first_metrics.get("num_lost", 0)),
+            int(final_metrics.get("num_active", 0)) + int(final_metrics.get("num_lost", 0)),
+        )
+    )
+
+    auc_trace = area_under_curve(times, traces)
+    auc_active_trace = area_under_curve(times, active_traces)
+    auc_logdet = area_under_curve(times, logdets)
+    auc_lost = area_under_curve(times, num_lost_series)
+    auc_active_count = area_under_curve(times, num_active_series)
+
+    normalized_auc_trace = auc_trace / mission_duration
+    normalized_auc_active_trace = auc_active_trace / mission_duration
+    normalized_auc_logdet = auc_logdet / mission_duration
+    normalized_auc_lost = auc_lost / mission_duration
+    normalized_auc_active_count = auc_active_count / mission_duration
+
+    num_detections = int(sum(len(frame.get("detections", [])) for frame in history))
 
     return {
         "final_time": float(final_frame["time"]),
+        "mission_duration": float(mission_duration),
         "num_frames": int(len(history)),
+        "initial_target_count": int(initial_target_count),
         "num_decisions": int(final_frame.get("decision_count", 0)),
-        "num_detections": int(
-            sum(len(frame.get("detections", [])) for frame in history)
-        ),
+        "num_detections": num_detections,
         "num_detection_events": int(len(detection_events)),
         "unique_detected_targets": int(len(unique_detected_targets)),
         "unique_selected_targets": int(len(unique_selected_targets)),
+
+        # Reference-replication metrics.
         "final_uncertainty_trace": float(traces[-1]),
+        "final_uncertainty_trace_per_target": float(traces[-1] / initial_target_count),
+        "final_active_uncertainty_trace": float(active_traces[-1]),
+        "final_uncertainty_logdet": float(logdets[-1]),
+
+        # Fair tracking-quality metrics.
+        "auc_uncertainty_trace": float(auc_trace),
+        "normalized_auc_uncertainty_trace": float(normalized_auc_trace),
+        "normalized_auc_uncertainty_trace_per_target": float(
+            normalized_auc_trace / initial_target_count
+        ),
+        "auc_active_uncertainty_trace": float(auc_active_trace),
+        "normalized_auc_active_uncertainty_trace": float(normalized_auc_active_trace),
+        "normalized_auc_active_uncertainty_trace_per_target": float(
+            normalized_auc_active_trace / initial_target_count
+        ),
+        "auc_uncertainty_logdet": float(auc_logdet),
+        "normalized_auc_uncertainty_logdet": float(normalized_auc_logdet),
+
+        # Frame-average diagnostics.
         "avg_uncertainty_trace": float(np.mean(traces)),
+        "avg_active_uncertainty_trace": float(np.nanmean(active_traces)),
+        "avg_uncertainty_logdet": float(np.mean(logdets)),
         "min_uncertainty_trace": float(np.min(traces)),
         "max_uncertainty_trace": float(np.max(traces)),
-        "auc_uncertainty_trace": area_under_curve(times, traces),
-        "final_active_uncertainty_trace": float(active_traces[-1]),
-        "avg_active_uncertainty_trace": float(np.nanmean(active_traces)),
-        "auc_active_uncertainty_trace": area_under_curve(times, active_traces),
-        "final_uncertainty_logdet": float(logdets[-1]),
-        "avg_uncertainty_logdet": float(np.mean(logdets)),
-        "auc_uncertainty_logdet": area_under_curve(times, logdets),
+
+        # Lost/active target metrics.
         "final_num_lost": int(final_metrics.get("num_lost", 0)),
         "max_num_lost": int(np.max(num_lost_series)),
         "avg_num_lost": float(np.mean(num_lost_series)),
-        "auc_num_lost": area_under_curve(times, num_lost_series),
+        "auc_num_lost": float(auc_lost),
+        "normalized_auc_num_lost": float(normalized_auc_lost),
         "final_num_active": int(final_metrics.get("num_active", 0)),
         "min_num_active": int(np.min(num_active_series)),
         "avg_num_active": float(np.mean(num_active_series)),
+        "auc_num_active": float(auc_active_count),
+        "normalized_auc_num_active": float(normalized_auc_active_count),
+
+        # Operational metrics.
         "distance_traveled": float(final_drone["distance_traveled"]),
+        "distance_per_detection": float(final_drone["distance_traveled"] / max(1, num_detections)),
         "selected_track_sequence": selected_track_sequence,
     }
 
 
 def area_under_curve(times: np.ndarray, values: np.ndarray) -> float:
-    """Compute trapezoidal AUC with guards for repeated time stamps."""
+    """Compute trapezoidal AUC with guards for nonfinite values."""
 
     if len(times) < 2:
         return 0.0
-
     if len(values) != len(times):
         raise ValueError("times and values must have the same length.")
 
     if np.any(~np.isfinite(values)):
         values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # np.trapezoid is newer; np.trapz keeps compatibility with older NumPy.
     return float(np.trapz(values, times))
 
 
@@ -306,7 +357,6 @@ def save_metrics_csv(metrics: list[dict[str, Any]], output_path: Path) -> None:
         return
 
     fieldnames = sorted({key for row in metrics for key in row.keys()})
-
     with output_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -324,12 +374,12 @@ def print_aggregate_table(metrics: list[dict[str, Any]]) -> None:
         return
 
     planners = sorted({row["planner"] for row in valid_rows})
-
     metric_names = [
-        "avg_uncertainty_trace",
         "final_uncertainty_trace",
-        "auc_uncertainty_trace",
+        "normalized_auc_uncertainty_trace",
+        "avg_uncertainty_trace",
         "final_num_lost",
+        "normalized_auc_num_lost",
         "num_detections",
         "distance_traveled",
         "num_decisions",
@@ -337,29 +387,22 @@ def print_aggregate_table(metrics: list[dict[str, Any]]) -> None:
     ]
 
     print("\nAggregate summary across seeds")
-    print("=" * 128)
-    header = f"{'planner':<18}" + "".join(f"{name:<26}" for name in metric_names)
+    print("=" * 170)
+    header = f"{'planner':<22}" + "".join(f"{name:<28}" for name in metric_names)
     print(header)
-    print("-" * 128)
+    print("-" * 170)
 
     for planner in planners:
         rows = [row for row in valid_rows if row["planner"] == planner]
-        line = f"{planner:<18}"
-
+        line = f"{planner:<22}"
         for name in metric_names:
             vals = np.array([row.get(name, np.nan) for row in rows], dtype=float)
             vals = vals[np.isfinite(vals)]
-
-            if len(vals) == 0:
-                cell = "n/a"
-            else:
-                cell = f"{np.mean(vals):.2f} ± {np.std(vals):.2f}"
-
-            line += cell.ljust(26)
-
+            cell = "n/a" if len(vals) == 0 else f"{np.mean(vals):.2f} ± {np.std(vals):.2f}"
+            line += cell.ljust(28)
         print(line)
 
-    print("=" * 128)
+    print("=" * 170)
 
 
 # ---------------------------------------------------------------------------
@@ -370,8 +413,24 @@ def analyze_mcts_vs_greedy(
     metrics: list[dict[str, Any]],
     output_path: Path,
     greedy_name: str = "greedy",
+    terminal_tolerance: float = 0.0,
+    auc_tolerance: float = 0.0,
 ) -> list[dict[str, Any]]:
-    """Compare MCTS-style planners against greedy on each seed."""
+    """Compare MCTS-style planners against greedy on each seed.
+
+    Three win conditions are reported:
+
+    - reference_terminal_win:
+        final uncertainty improves and final lost count does not worsen.
+
+    - tracking_quality_win:
+        normalized AUC uncertainty improves, final uncertainty does not worsen,
+        and final lost count does not worsen.
+
+    - balanced_win:
+        final uncertainty and normalized AUC both improve, with no worse final
+        lost count.
+    """
 
     valid_rows = [row for row in metrics if "error" not in row]
     by_seed_planner = {
@@ -381,7 +440,6 @@ def analyze_mcts_vs_greedy(
 
     seeds = sorted({int(row["seed"]) for row in valid_rows})
     planner_names = sorted({str(row["planner"]) for row in valid_rows})
-
     candidate_mcts_names = [
         name
         for name in planner_names
@@ -398,36 +456,50 @@ def analyze_mcts_vs_greedy(
         for planner_name in candidate_mcts_names:
             if planner_name == greedy_name:
                 continue
-
             candidate = by_seed_planner.get((seed, planner_name))
             if candidate is None:
                 continue
 
-            final_delta = (
-                float(candidate["final_uncertainty_trace"])
-                - float(greedy["final_uncertainty_trace"])
+            final_delta = float(candidate["final_uncertainty_trace"]) - float(greedy["final_uncertainty_trace"])
+            final_per_target_delta = float(candidate["final_uncertainty_trace_per_target"]) - float(
+                greedy["final_uncertainty_trace_per_target"]
             )
-            avg_delta = (
-                float(candidate["avg_uncertainty_trace"])
-                - float(greedy["avg_uncertainty_trace"])
+            norm_auc_delta = float(candidate["normalized_auc_uncertainty_trace"]) - float(
+                greedy["normalized_auc_uncertainty_trace"]
             )
-            auc_delta = (
-                float(candidate["auc_uncertainty_trace"])
-                - float(greedy["auc_uncertainty_trace"])
+            norm_auc_per_target_delta = float(candidate["normalized_auc_uncertainty_trace_per_target"]) - float(
+                greedy["normalized_auc_uncertainty_trace_per_target"]
+            )
+            raw_auc_delta = float(candidate["auc_uncertainty_trace"]) - float(greedy["auc_uncertainty_trace"])
+            frame_avg_delta = float(candidate["avg_uncertainty_trace"]) - float(greedy["avg_uncertainty_trace"])
+            active_norm_auc_delta = float(candidate["normalized_auc_active_uncertainty_trace"]) - float(
+                greedy["normalized_auc_active_uncertainty_trace"]
             )
             lost_delta = int(candidate["final_num_lost"]) - int(greedy["final_num_lost"])
-            detection_delta = int(candidate["num_detections"]) - int(greedy["num_detections"])
-            distance_delta = (
-                float(candidate["distance_traveled"])
-                - float(greedy["distance_traveled"])
+            norm_lost_auc_delta = float(candidate["normalized_auc_num_lost"]) - float(
+                greedy["normalized_auc_num_lost"]
             )
+            detection_delta = int(candidate["num_detections"]) - int(greedy["num_detections"])
+            distance_delta = float(candidate["distance_traveled"]) - float(greedy["distance_traveled"])
 
-            # Lower uncertainty/lost is better. More detections can be good but is
-            # not automatically decisive.
-            beats_greedy_primary = (
-                auc_delta < 0.0
-                and final_delta <= 0.0
+            reference_terminal_win = final_delta < -terminal_tolerance and lost_delta <= 0
+            tracking_quality_win = (
+                norm_auc_delta < -auc_tolerance
+                and final_delta <= terminal_tolerance
                 and lost_delta <= 0
+            )
+            balanced_win = (
+                final_delta < -terminal_tolerance
+                and norm_auc_delta < -auc_tolerance
+                and lost_delta <= 0
+            )
+            terminal_only_tradeoff = (
+                reference_terminal_win
+                and norm_auc_delta >= -auc_tolerance
+            )
+            tracking_only_tradeoff = (
+                tracking_quality_win
+                and final_delta >= -terminal_tolerance
             )
 
             comparisons.append(
@@ -438,33 +510,41 @@ def analyze_mcts_vs_greedy(
                     "planner_final_uncertainty": candidate["final_uncertainty_trace"],
                     "greedy_final_uncertainty": greedy["final_uncertainty_trace"],
                     "delta_final_uncertainty": final_delta,
-                    "planner_avg_uncertainty": candidate["avg_uncertainty_trace"],
-                    "greedy_avg_uncertainty": greedy["avg_uncertainty_trace"],
-                    "delta_avg_uncertainty": avg_delta,
-                    "planner_auc_uncertainty": candidate["auc_uncertainty_trace"],
-                    "greedy_auc_uncertainty": greedy["auc_uncertainty_trace"],
-                    "delta_auc_uncertainty": auc_delta,
+                    "delta_final_uncertainty_per_target": final_per_target_delta,
+                    "planner_normalized_auc_uncertainty": candidate["normalized_auc_uncertainty_trace"],
+                    "greedy_normalized_auc_uncertainty": greedy["normalized_auc_uncertainty_trace"],
+                    "delta_normalized_auc_uncertainty": norm_auc_delta,
+                    "delta_normalized_auc_uncertainty_per_target": norm_auc_per_target_delta,
+                    "planner_raw_auc_uncertainty": candidate["auc_uncertainty_trace"],
+                    "greedy_raw_auc_uncertainty": greedy["auc_uncertainty_trace"],
+                    "delta_raw_auc_uncertainty": raw_auc_delta,
+                    "planner_frame_avg_uncertainty": candidate["avg_uncertainty_trace"],
+                    "greedy_frame_avg_uncertainty": greedy["avg_uncertainty_trace"],
+                    "delta_frame_avg_uncertainty": frame_avg_delta,
+                    "delta_normalized_auc_active_uncertainty": active_norm_auc_delta,
                     "planner_lost": candidate["final_num_lost"],
                     "greedy_lost": greedy["final_num_lost"],
                     "delta_lost": lost_delta,
+                    "delta_normalized_auc_lost": norm_lost_auc_delta,
                     "planner_detections": candidate["num_detections"],
                     "greedy_detections": greedy["num_detections"],
                     "delta_detections": detection_delta,
                     "planner_distance": candidate["distance_traveled"],
                     "greedy_distance": greedy["distance_traveled"],
                     "delta_distance": distance_delta,
-                    "beats_greedy_primary": beats_greedy_primary,
-                    "possible_long_term_planning_win": (
-                        auc_delta < 0.0
-                        and distance_delta >= 0.0
-                        and lost_delta <= 0
-                    ),
+                    "reference_terminal_win": reference_terminal_win,
+                    "tracking_quality_win": tracking_quality_win,
+                    "balanced_win": balanced_win,
+                    "terminal_only_tradeoff": terminal_only_tradeoff,
+                    "tracking_only_tradeoff": tracking_only_tradeoff,
+                    # Backward-compatible alias for older scripts.
+                    "beats_greedy_primary": tracking_quality_win,
+                    "possible_long_term_planning_win": terminal_only_tradeoff,
                 }
             )
 
     save_dicts_csv(comparisons, output_path)
     print_mcts_vs_greedy_summary(comparisons)
-
     return comparisons
 
 
@@ -476,27 +556,37 @@ def print_mcts_vs_greedy_summary(comparisons: list[dict[str, Any]]) -> None:
     planners = sorted({row["planner"] for row in comparisons})
 
     print("\nMCTS-style planners vs greedy")
-    print("=" * 96)
+    print("=" * 132)
+    print(
+        "terminal = reference-style final uncertainty win | "
+        "tracking = normalized-AUC win | balanced = both"
+    )
 
     for planner in planners:
         rows = [row for row in comparisons if row["planner"] == planner]
-        wins = sum(1 for row in rows if row["beats_greedy_primary"])
-        long_term = sum(1 for row in rows if row["possible_long_term_planning_win"])
+        terminal_wins = sum(1 for row in rows if row["reference_terminal_win"])
+        tracking_wins = sum(1 for row in rows if row["tracking_quality_win"])
+        balanced_wins = sum(1 for row in rows if row["balanced_win"])
+        terminal_only = sum(1 for row in rows if row["terminal_only_tradeoff"])
+        tracking_only = sum(1 for row in rows if row["tracking_only_tradeoff"])
 
-        auc_deltas = np.array([row["delta_auc_uncertainty"] for row in rows], dtype=float)
+        norm_auc_deltas = np.array([row["delta_normalized_auc_uncertainty"] for row in rows], dtype=float)
         final_deltas = np.array([row["delta_final_uncertainty"] for row in rows], dtype=float)
         lost_deltas = np.array([row["delta_lost"] for row in rows], dtype=float)
 
         print(
-            f"{planner:<18} "
-            f"wins={wins}/{len(rows)} | "
-            f"long_term_flags={long_term}/{len(rows)} | "
-            f"mean_delta_auc={np.mean(auc_deltas):.2f} | "
+            f"{planner:<24} "
+            f"terminal={terminal_wins}/{len(rows)} | "
+            f"tracking={tracking_wins}/{len(rows)} | "
+            f"balanced={balanced_wins}/{len(rows)} | "
+            f"terminal_only={terminal_only}/{len(rows)} | "
+            f"tracking_only={tracking_only}/{len(rows)} | "
             f"mean_delta_final={np.mean(final_deltas):.2f} | "
+            f"mean_delta_norm_auc={np.mean(norm_auc_deltas):.2f} | "
             f"mean_delta_lost={np.mean(lost_deltas):.2f}"
         )
 
-    print("=" * 96)
+    print("=" * 132)
 
 
 def save_dicts_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
@@ -504,7 +594,6 @@ def save_dicts_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
         return
 
     fieldnames = sorted({key for row in rows for key in row.keys()})
-
     with output_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -526,18 +615,12 @@ def run_path_for(output_dir: Path, planner_name: str, seed: int) -> Path:
     return output_dir / f"{planner_name}_seed{seed}.json"
 
 
-def available_successful_planners(
-    output_dir: Path,
-    planners: dict[str, str],
-    seed: int,
-) -> list[str]:
-    names = []
-
-    for planner_name in planners:
-        if run_path_for(output_dir, planner_name, seed).exists():
-            names.append(planner_name)
-
-    return names
+def available_successful_planners(output_dir: Path, planners: dict[str, str], seed: int) -> list[str]:
+    return [
+        planner_name
+        for planner_name in planners
+        if run_path_for(output_dir, planner_name, seed).exists()
+    ]
 
 
 def extract_series(run: dict[str, Any], key: str) -> tuple[np.ndarray, np.ndarray]:
@@ -547,30 +630,17 @@ def extract_series(run: dict[str, Any], key: str) -> tuple[np.ndarray, np.ndarra
     times = np.array([frame["time"] for frame in history], dtype=float)
 
     if key == "total_uncertainty":
-        values = np.array(
-            [frame["metrics"]["total_position_trace"] for frame in history],
-            dtype=float,
-        )
+        values = np.array([frame["metrics"]["total_position_trace"] for frame in history], dtype=float)
     elif key == "active_uncertainty":
-        values = np.array(
-            [frame["metrics"].get("active_position_trace", np.nan) for frame in history],
-            dtype=float,
-        )
+        values = np.array([frame["metrics"].get("active_position_trace", np.nan) for frame in history], dtype=float)
     elif key == "num_lost":
-        values = np.array(
-            [frame["metrics"].get("num_lost", 0) for frame in history],
-            dtype=float,
-        )
+        values = np.array([frame["metrics"].get("num_lost", 0) for frame in history], dtype=float)
     elif key == "num_active":
-        values = np.array(
-            [frame["metrics"].get("num_active", 0) for frame in history],
-            dtype=float,
-        )
+        values = np.array([frame["metrics"].get("num_active", 0) for frame in history], dtype=float)
     elif key == "selected_track":
         values = np.array(
             [
-                np.nan if frame.get("selected_track_id") is None
-                else float(frame.get("selected_track_id"))
+                np.nan if frame.get("selected_track_id") is None else float(frame.get("selected_track_id"))
                 for frame in history
             ],
             dtype=float,
@@ -582,7 +652,7 @@ def extract_series(run: dict[str, Any], key: str) -> tuple[np.ndarray, np.ndarra
 
 
 # ---------------------------------------------------------------------------
-# Plotting: aggregate metric bars
+# Plotting
 # ---------------------------------------------------------------------------
 
 def make_bar_plot(
@@ -597,16 +667,12 @@ def make_bar_plot(
         return
 
     planners = sorted({row["planner"] for row in valid_rows})
-    means = []
-    stds = []
+    means: list[float] = []
+    stds: list[float] = []
 
     for planner in planners:
         vals = np.array(
-            [
-                row[metric_name]
-                for row in valid_rows
-                if row["planner"] == planner and metric_name in row
-            ],
+            [row[metric_name] for row in valid_rows if row["planner"] == planner and metric_name in row],
             dtype=float,
         )
         vals = vals[np.isfinite(vals)]
@@ -625,34 +691,43 @@ def make_bar_plot(
     print(f"Saved plot: {output_path}")
 
 
-def make_final_metric_bar_charts(
-    metrics: list[dict[str, Any]],
-    output_dir: Path,
-) -> None:
+def make_final_metric_bar_charts(metrics: list[dict[str, Any]], output_dir: Path) -> None:
     specs = [
-        (
-            "avg_uncertainty_trace",
-            "Average total covariance trace",
-            "Average uncertainty by planner",
-            "average_uncertainty_trace.png",
-        ),
         (
             "final_uncertainty_trace",
             "Final total covariance trace",
-            "Final uncertainty by planner",
+            "Reference-style terminal uncertainty by planner",
             "final_uncertainty_trace.png",
         ),
         (
+            "normalized_auc_uncertainty_trace",
+            "Time-normalized AUC covariance trace",
+            "Fair continuous-time average uncertainty by planner",
+            "normalized_auc_uncertainty_trace.png",
+        ),
+        (
+            "avg_uncertainty_trace",
+            "Frame-average total covariance trace",
+            "Frame-average uncertainty diagnostic by planner",
+            "average_uncertainty_trace.png",
+        ),
+        (
             "auc_uncertainty_trace",
-            "AUC of total covariance trace",
-            "Time-integrated uncertainty by planner",
+            "Raw AUC of total covariance trace",
+            "Raw time-integrated uncertainty by planner",
             "auc_uncertainty_trace.png",
         ),
         (
             "final_num_lost",
             "Final number of lost targets",
-            "Lost targets by planner",
+            "Final lost targets by planner",
             "lost_targets.png",
+        ),
+        (
+            "normalized_auc_num_lost",
+            "Time-normalized lost target count",
+            "Continuous-time average lost targets by planner",
+            "normalized_lost_targets.png",
         ),
         (
             "num_detections",
@@ -690,10 +765,6 @@ def make_final_metric_bar_charts(
         )
 
 
-# ---------------------------------------------------------------------------
-# Plotting: time series
-# ---------------------------------------------------------------------------
-
 def make_uncertainty_time_plot(
     output_dir: Path,
     planners: dict[str, str],
@@ -701,7 +772,6 @@ def make_uncertainty_time_plot(
     output_path: Path,
 ) -> None:
     plt.figure(figsize=(11, 5))
-
     for planner_name in available_successful_planners(output_dir, planners, seed):
         run = load_run(run_path_for(output_dir, planner_name, seed))
         times, traces = extract_series(run, "total_uncertainty")
@@ -724,19 +794,11 @@ def make_active_lost_time_plot(
     seed: int,
     output_path: Path,
 ) -> None:
-    """Plot active/lost target counts over time.
-
-    Uses solid line for active and dashed line for lost for each planner.
-    """
-
     plt.figure(figsize=(11, 5))
-
     for planner_name in available_successful_planners(output_dir, planners, seed):
         run = load_run(run_path_for(output_dir, planner_name, seed))
-
         times, active = extract_series(run, "num_active")
         _, lost = extract_series(run, "num_lost")
-
         plt.plot(times, active, label=f"{planner_name} active")
         plt.plot(times, lost, linestyle="--", label=f"{planner_name} lost")
 
@@ -758,22 +820,12 @@ def make_selected_target_time_plot(
     output_path: Path,
 ) -> None:
     plt.figure(figsize=(11, 5))
-
     for planner_name in available_successful_planners(output_dir, planners, seed):
         run = load_run(run_path_for(output_dir, planner_name, seed))
         times, selected = extract_series(run, "selected_track")
-
-        # Keep only frames where a selected target exists.
         mask = np.isfinite(selected)
-        if not np.any(mask):
-            continue
-
-        plt.step(
-            times[mask],
-            selected[mask],
-            where="post",
-            label=planner_name,
-        )
+        if np.any(mask):
+            plt.step(times[mask], selected[mask], where="post", label=planner_name)
 
     plt.xlabel("Mission time")
     plt.ylabel("Selected track ID")
@@ -786,67 +838,30 @@ def make_selected_target_time_plot(
     print(f"Saved plot: {output_path}")
 
 
-# ---------------------------------------------------------------------------
-# Plotting: trajectories
-# ---------------------------------------------------------------------------
-
-def make_trajectory_plot_for_run(
-    run: dict[str, Any],
-    title: str,
-    output_path: Path,
-) -> None:
-    """Plot UAV trajectory and target trajectories for one saved run."""
-
+def make_trajectory_plot_for_run(run: dict[str, Any], title: str, output_path: Path) -> None:
     history = run["history"]
     if not history:
         return
 
-    drone_xy = np.array(
-        [frame["drone"]["position"] for frame in history],
-        dtype=float,
-    )
-
-    target_ids = sorted(
-        {
-            int(target_id)
-            for frame in history
-            for target_id in frame.get("targets", {}).keys()
-        }
-    )
+    drone_xy = np.array([frame["drone"]["position"] for frame in history], dtype=float)
+    target_ids = sorted({int(target_id) for frame in history for target_id in frame.get("targets", {}).keys()})
 
     plt.figure(figsize=(7, 7))
-
-    # UAV trajectory.
     plt.plot(drone_xy[:, 0], drone_xy[:, 1], label="UAV")
     plt.scatter(drone_xy[0, 0], drone_xy[0, 1], marker="o", label="UAV start")
     plt.scatter(drone_xy[-1, 0], drone_xy[-1, 1], marker="x", label="UAV end")
 
-    # Target trajectories.
     for target_id in target_ids:
         xy = []
-        active_flags = []
-
         for frame in history:
             target = frame.get("targets", {}).get(str(target_id))
-            if target is None:
-                continue
-
-            xy.append(target["position"])
-            active_flags.append(bool(target.get("is_active", True)))
-
-        if not xy:
-            continue
-
-        xy_arr = np.array(xy, dtype=float)
-
-        plt.plot(
-            xy_arr[:, 0],
-            xy_arr[:, 1],
-            linestyle="--",
-            label=f"target {target_id}",
-        )
-        plt.scatter(xy_arr[0, 0], xy_arr[0, 1], marker="o")
-        plt.scatter(xy_arr[-1, 0], xy_arr[-1, 1], marker="x")
+            if target is not None:
+                xy.append(target["position"])
+        if xy:
+            xy_arr = np.array(xy, dtype=float)
+            plt.plot(xy_arr[:, 0], xy_arr[:, 1], linestyle="--", label=f"target {target_id}")
+            plt.scatter(xy_arr[0, 0], xy_arr[0, 1], marker="o")
+            plt.scatter(xy_arr[-1, 0], xy_arr[-1, 1], marker="x")
 
     plt.xlabel("x")
     plt.ylabel("y")
@@ -860,13 +875,7 @@ def make_trajectory_plot_for_run(
     print(f"Saved plot: {output_path}")
 
 
-def make_trajectory_plots(
-    output_dir: Path,
-    planners: dict[str, str],
-    seed: int,
-) -> None:
-    """Create one UAV/target trajectory plot per planner for a representative seed."""
-
+def make_trajectory_plots(output_dir: Path, planners: dict[str, str], seed: int) -> None:
     traj_dir = output_dir / f"trajectories_seed{seed}"
     traj_dir.mkdir(parents=True, exist_ok=True)
 
@@ -879,10 +888,6 @@ def make_trajectory_plots(
         )
 
 
-# ---------------------------------------------------------------------------
-# Plot orchestration
-# ---------------------------------------------------------------------------
-
 def make_all_plots(
     metrics: list[dict[str, Any]],
     planners: dict[str, str],
@@ -890,38 +895,29 @@ def make_all_plots(
     output_dir: Path,
 ) -> None:
     make_final_metric_bar_charts(metrics, output_dir)
-
     if not seeds:
         return
 
     representative_seed = seeds[0]
-
     make_uncertainty_time_plot(
         output_dir=output_dir,
         planners=planners,
         seed=representative_seed,
         output_path=output_dir / f"uncertainty_over_time_seed{representative_seed}.png",
     )
-
     make_active_lost_time_plot(
         output_dir=output_dir,
         planners=planners,
         seed=representative_seed,
         output_path=output_dir / f"active_lost_over_time_seed{representative_seed}.png",
     )
-
     make_selected_target_time_plot(
         output_dir=output_dir,
         planners=planners,
         seed=representative_seed,
         output_path=output_dir / f"selected_target_over_time_seed{representative_seed}.png",
     )
-
-    make_trajectory_plots(
-        output_dir=output_dir,
-        planners=planners,
-        seed=representative_seed,
-    )
+    make_trajectory_plots(output_dir=output_dir, planners=planners, seed=representative_seed)
 
 
 # ---------------------------------------------------------------------------
@@ -932,18 +928,14 @@ def parse_planner_args(planner_args: list[str] | None) -> dict[str, str]:
     """Parse planner CLI values.
 
     Accepts values like:
-        random=core.planners.random_planner.RandomPlanner
         greedy=core.planners.greedy_planners.GreedyDistanceAwarePlanner
-        mcts=core.planners.mcts_planner.MCTSPlanner
-
-    If omitted, DEFAULT_PLANNERS is used.
+        legacy_mcts=core.planners.mcts_legacy_dwell_planner.LegacyDwellMDPMCTSPlanner
     """
 
     if not planner_args:
         return DEFAULT_PLANNERS.copy()
 
     planners: dict[str, str] = {}
-
     for item in planner_args:
         if "=" in item:
             name, path = item.split("=", 1)
@@ -953,12 +945,10 @@ def parse_planner_args(planner_args: list[str] | None) -> dict[str, str]:
 
         name = name.strip()
         path = path.strip()
-
         if not name:
             raise ValueError(f"Invalid planner spec with empty name: {item}")
         if not path:
             raise ValueError(f"Invalid planner spec with empty path: {item}")
-
         planners[name] = path
 
     return planners
@@ -970,31 +960,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="runs/comparison")
     parser.add_argument("--seeds", type=int, nargs="+", default=[7])
-
     parser.add_argument(
         "--planners",
         type=str,
         nargs="*",
         default=None,
-        help=(
-            "Optional planner specs like name=module.Class. "
-            "If omitted, random, greedy, MCTS, warm MCTS, and guided MCTS are run."
-        ),
+        help="Optional planner specs like name=module.Class.",
     )
-
     parser.add_argument(
         "--greedy-name",
         type=str,
         default="greedy",
         help="Planner name to use as the greedy baseline for MCTS-vs-greedy analysis.",
     )
-
+    parser.add_argument(
+        "--terminal-tolerance",
+        type=float,
+        default=0.0,
+        help="Small tolerance for final-uncertainty win comparisons.",
+    )
+    parser.add_argument(
+        "--auc-tolerance",
+        type=float,
+        default=0.0,
+        help="Small tolerance for normalized-AUC win comparisons.",
+    )
     parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Run simulations and save CSVs, but do not create PNG plots.",
     )
-
     parser.add_argument(
         "--continue-on-error",
         action="store_true",
@@ -1026,15 +1021,12 @@ def main() -> None:
         metrics=metrics,
         output_path=output_dir / "mcts_vs_greedy_analysis.csv",
         greedy_name=args.greedy_name,
+        terminal_tolerance=float(args.terminal_tolerance),
+        auc_tolerance=float(args.auc_tolerance),
     )
 
     if not args.no_plots:
-        make_all_plots(
-            metrics=metrics,
-            planners=planners,
-            seeds=args.seeds,
-            output_dir=output_dir,
-        )
+        make_all_plots(metrics=metrics, planners=planners, seeds=args.seeds, output_dir=output_dir)
 
 
 if __name__ == "__main__":

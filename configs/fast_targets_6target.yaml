@@ -1,0 +1,47 @@
+seed: 51
+dt: 0.5
+mission_budget: 900.0
+max_steps: 10000
+opportunistic_detections: false
+
+drone:
+  initial_position: [0.0, 0.0]
+  speed: 30.0
+  sensor_range: 50.0
+  detection_probability: 1.0
+
+belief:
+  acceleration_noise_std: 0.06
+  measurement_noise_std: 22.0
+  initial_position_std: 90.0
+  initial_velocity_std: 4.0
+  covariance_scale_for_search: 2.25
+
+search:
+  max_search_time_per_decision: 65.0
+
+loss:
+  max_position_trace_before_lost: 250000.0
+  max_position_logdet_before_lost:
+  max_time_since_seen_before_lost:
+  lost_target_penalty: 1000000.0
+
+targets:
+  - target_id: 1
+    initial_state: [450.0, 230.0, 4.2, -0.8]
+    process_noise_std: [0.0, 0.0, 0.006, 0.006]
+  - target_id: 2
+    initial_state: [-520.0, 320.0, 3.1, -2.7]
+    process_noise_std: [0.0, 0.0, 0.006, 0.006]
+  - target_id: 3
+    initial_state: [650.0, -430.0, -3.4, 2.5]
+    process_noise_std: [0.0, 0.0, 0.006, 0.006]
+  - target_id: 4
+    initial_state: [-720.0, -250.0, 4.0, 1.7]
+    process_noise_std: [0.0, 0.0, 0.007, 0.007]
+  - target_id: 5
+    initial_state: [120.0, 780.0, -1.6, -4.1]
+    process_noise_std: [0.0, 0.0, 0.006, 0.006]
+  - target_id: 6
+    initial_state: [820.0, 180.0, -4.0, -1.1]
+    process_noise_std: [0.0, 0.0, 0.007, 0.007]

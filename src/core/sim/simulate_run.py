@@ -98,7 +98,16 @@ class SimConfig:
     max_position_logdet_before_lost: float | None = None
     max_time_since_seen_before_lost: float | None = None
     min_existence_probability_before_lost: float | None = None
-    lost_target_penalty: float = 1000000.0
+    lost_target_penalty: float = 0.0
+
+    # Loss model controls.  The professor/legacy-style model is:
+    #   - do NOT mark a track lost merely because covariance is large;
+    #   - keep true targets moving/detectable even if a belief becomes lost;
+    #   - optionally mark a track lost only after a real search timeout.
+    # Defaults below follow that legacy-style model.
+    use_covariance_loss_threshold: bool = False
+    deactivate_true_target_when_lost: bool = False
+    mark_track_lost_on_search_timeout: bool = False
 
     drone_initial_position: list[float] = field(default_factory=lambda: [0.0, 0.0])
     drone_speed: float = 30.0
@@ -160,7 +169,16 @@ def load_config_from_yaml(path: Path) -> SimConfig:
         min_existence_probability_before_lost=loss.get(
             "min_existence_probability_before_lost", None
         ),
-        lost_target_penalty=float(loss.get("lost_target_penalty", 1000000.0)),
+        lost_target_penalty=float(loss.get("lost_target_penalty", 0.0)),
+        use_covariance_loss_threshold=bool(
+            loss.get("use_covariance_loss_threshold", False)
+        ),
+        deactivate_true_target_when_lost=bool(
+            loss.get("deactivate_true_target_when_lost", False)
+        ),
+        mark_track_lost_on_search_timeout=bool(
+            loss.get("mark_track_lost_on_search_timeout", False)
+        ),
         targets=raw.get("targets", []),
     )
 
@@ -305,12 +323,23 @@ class SimulationState:
         self.selected_track_id = int(selected_id)
         selected_track = self.tracks[self.selected_track_id]
 
+        initial_distance = float(
+            np.linalg.norm(
+                np.asarray(selected_track.position, dtype=float)
+                - np.asarray(self.drone.position, dtype=float)
+            )
+        )
+
+        lead_time = initial_distance / max(1e-9, float(self.drone.speed))
+
         self.spiral_planner = EllipticShiftingSpiralPlanner.from_track(
             track=selected_track,
             sensor_width=self.drone.sensor_width,
             dt=self.config.dt,
             covariance_scale=self.config.covariance_scale_for_search,
+            lead_time=lead_time,
         )
+
         self.spiral_state = self.spiral_planner.initial_state()
         self.search_elapsed = 0.0
         self.decision_count += 1
@@ -436,6 +465,23 @@ class SimulationState:
             self.finish_current_action(outcome="miss")
         elif self.search_elapsed >= self.config.max_search_time_per_decision:
             event = "search_timeout"
+
+            # Optional strict legacy-style real-world give-up model: a real
+            # search timeout can mark the selected track unavailable.  The
+            # recommended default is False; MCTS branches can remove missed
+            # targets without making the real simulator permanently brittle.
+            if self.config.mark_track_lost_on_search_timeout:
+                try:
+                    self.tracks[self.selected_track_id].mark_lost(
+                        current_time=self.drone.elapsed_time,
+                        reason="search_timeout",
+                    )
+                    self.newly_lost_tracks.append(int(self.selected_track_id))
+                    if self.config.deactivate_true_target_when_lost:
+                        self.targets[self.selected_track_id].mark_lost()
+                except KeyError:
+                    pass
+
             self.finish_current_action(outcome="miss")
         elif not self.drone.is_active:
             event = "budget_depleted"
@@ -467,24 +513,32 @@ class SimulationState:
             existence_decay_rate=0.0,
         )
 
-        newly_lost = self.tracks.check_lost_tracks(
-            current_time=self.drone.elapsed_time,
-            max_position_trace=self.config.max_position_trace_before_lost,
-            max_position_logdet=self.config.max_position_logdet_before_lost,
-            max_time_since_seen=self.config.max_time_since_seen_before_lost,
-            min_existence_probability=self.config.min_existence_probability_before_lost,
-        )
+        newly_lost: list[int] = []
+
+        # Legacy/professor-style default: do not declare a target lost just
+        # because its covariance became large.  Let uncertainty continue to
+        # propagate unless the config explicitly enables covariance loss.
+        if self.config.use_covariance_loss_threshold:
+            newly_lost = self.tracks.check_lost_tracks(
+                current_time=self.drone.elapsed_time,
+                max_position_trace=self.config.max_position_trace_before_lost,
+                max_position_logdet=self.config.max_position_logdet_before_lost,
+                max_time_since_seen=self.config.max_time_since_seen_before_lost,
+                min_existence_probability=self.config.min_existence_probability_before_lost,
+            )
 
         if newly_lost:
             self.newly_lost_tracks = newly_lost
 
-            # Important: when the belief track is lost, deactivate the corresponding
-            # true target so it stops moving and stops being detectable.
-            for track_id in newly_lost:
-                try:
-                    self.targets[track_id].mark_lost()
-                except KeyError:
-                    pass
+            # Keep true targets moving by default.  This avoids the artificial
+            # assumption that the physical target stops existing/stops moving
+            # when the tracker becomes uncertain.
+            if self.config.deactivate_true_target_when_lost:
+                for track_id in newly_lost:
+                    try:
+                        self.targets[track_id].mark_lost()
+                    except KeyError:
+                        pass
 
     def detect_and_update_tracks(self):
         raw_detections = self.drone.detect_targets(self.targets.positions_dict())

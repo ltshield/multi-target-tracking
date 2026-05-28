@@ -10,31 +10,31 @@ Realtime conditional interface:
     plan_during_execution(planner_input, rng, planning_seconds) -> None
     finish_conditional_planning(outcome, planner_input, rng) -> int | None
 
+Objective modes
+---------------
+Set objective_mode near the top of MCTSPlanner:
+
+    "terminal"
+        Score only the final imagined rollout state.
+        This is closest to the previous implementation.
+
+    "auc"
+        Score accumulated tracking cost over the imagined rollout.
+        This tries to minimize average uncertainty over time.
+
+    "blended"
+        Score both accumulated tracking cost and terminal state cost.
+        This is usually the best debugging/default option.
+
 Key design goals
 ----------------
 1. Every planner receives the same valid action list through PlannerInput.
 2. MCTS does not privately invent a different action set.
-3. Rollout/value scoring is aligned with final evaluation:
-      uncertainty cost
-      lost-target penalty
-      optional travel-distance penalty
-      optional detection reward
+3. MCTS can optimize terminal uncertainty, AUC uncertainty, or both.
 4. Repeated easy detections are discouraged through marginal value, not a
    hard-coded cooldown.
 5. Tracks approaching the lost threshold receive higher priority through a
    principled loss-risk multiplier.
-
-This planner uses a State -> Action -> Outcome -> State tree:
-
-    state
-      action: pursue track i
-        outcome: find
-          next state
-        outcome: miss
-          next state
-
-The low-level spiral search is approximated by a coverage estimator inside
-MCTS. The real simulator still executes the actual pursuit/search behavior.
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ from core.sim.tracks import Track, constant_velocity_F, constant_velocity_Q
 
 
 Outcome = Literal["find", "miss"]
+ObjectiveMode = Literal["terminal", "auc", "blended"]
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +124,7 @@ class BeliefState:
         self.time_since_seen += dt
 
     def kalman_position_update_at_mean(self, measurement_noise_std: float) -> None:
-        """Shrink covariance as if the target was detected at predicted mean.
-
-        For planning, the exact measurement innovation is less important than
-        the covariance reduction caused by receiving a position measurement.
-        Using z = H @ mean gives zero innovation but the correct covariance
-        shrinkage.
-        """
+        """Shrink covariance as if the target was detected at predicted mean."""
 
         if measurement_noise_std <= 0.0:
             raise ValueError("measurement_noise_std must be positive.")
@@ -173,9 +168,12 @@ class PlanningState:
     distance_traveled: float = 0.0
     detections: int = 0
 
+    # AUC-style objective bookkeeping.
+    cumulative_tracking_cost: float = 0.0
+    cumulative_time: float = 0.0
+
     # Number of tracks already lost in the real simulator before this MCTS
-    # branch begins. The root beliefs only contain currently valid/active tracks,
-    # so this prevents MCTS from forgetting previous losses.
+    # branch begins.
     lost_count_initial: int = 0
 
     def copy(self) -> "PlanningState":
@@ -187,6 +185,8 @@ class PlanningState:
             depth=int(self.depth),
             distance_traveled=float(self.distance_traveled),
             detections=int(self.detections),
+            cumulative_tracking_cost=float(self.cumulative_tracking_cost),
+            cumulative_time=float(self.cumulative_time),
             lost_count_initial=int(self.lost_count_initial),
         )
 
@@ -249,68 +249,80 @@ class ActionNode:
 class MCTSPlanner:
     """Realtime conditional MCTS target-selection planner."""
 
-    # Initial/blocking call budget used when choose_track is called from scratch.
-    iterations: int = 750
+    # ------------------------------------------------------------------
+    # Main objective toggle
+    # ------------------------------------------------------------------
 
-    # Background compute model.
+    # Options:
+    #   "terminal" = optimize final rollout state
+    #   "auc"      = optimize accumulated uncertainty over rollout time
+    #   "blended"  = optimize both AUC and terminal state
+    objective_mode: ObjectiveMode = "auc"
+
+    # Used when objective_mode is "auc" or "blended".
+    rollout_auc_weight: float = 0.001
+
+    # Used when objective_mode is "terminal" or "blended".
+    terminal_state_weight: float = 1.0
+
+    # If True, convert accumulated cost to average cost over simulated time.
+    # If False, use raw AUC cost.
+    #
+    # For comparison with your evaluation's AUC metric, False is more direct.
+    # For stabilizing across branches of different lengths, True can be useful.
+    use_average_cost_for_auc: bool = True
+
+    # ------------------------------------------------------------------
+    # Compute / search settings
+    # ------------------------------------------------------------------
+
+    iterations: int = 3000
+
     iterations_per_second: float = 80.0
     min_background_iterations_per_call: int = 1
-    max_background_iterations_per_call: int = 250
+    max_background_iterations_per_call: int = 500
 
-    # Tree search settings.
-    max_depth: int = 5
+    max_depth: int = 7
     exploration_weight: float = 1.4
 
-    # Internal model parameters. Keep these roughly aligned with SimConfig.
+    # ------------------------------------------------------------------
+    # Internal model parameters. Keep roughly aligned with SimConfig.
+    # ------------------------------------------------------------------
+
     max_search_time: float = 65.0
     acceleration_noise_std: float = 0.03
     measurement_noise_std: float = 20.0
     covariance_scale_for_detection: float = 3.0
 
-    # Objective settings.
+    # ------------------------------------------------------------------
+    # Objective settings
+    # ------------------------------------------------------------------
+
     use_logdet_objective: bool = False
     lost_trace_threshold: float = 250_000.0
-
-    # Make losing targets very expensive inside MCTS. This should be at least as
-    # large as the simulator's lost_target_penalty.
     lost_target_penalty: float = 1_000_000.0
 
-    # Shared-objective-style scoring weights.
     uncertainty_weight: float = 1.0
     travel_distance_weight: float = 0.0
     detection_reward: float = 0.0
 
     # Heuristic shaping.
-    # These do not force rotation. They estimate marginal usefulness.
     distance_bias_seconds: float = 30.0
     loss_risk_max_multiplier: float = 50.0
     measurement_trace_floor_scale: float = 2.0
 
-    # Terminal evaluation.
-    #
-    # If max_depth is small and remaining_budget is large, predicting all the way
-    # to mission end can make many branches collapse into identical catastrophic
-    # values. Keep 0.0 while debugging. Later, try 30.0 or 65.0.
-    terminal_tail_time: float = 0.0
+    # Terminal tail for terminal/blended objectives.
+    terminal_tail_time: float = 65.0
 
     # Tie-breakers for saturated catastrophic branches.
-    # These prevent every "all targets lost" rollout from receiving exactly
-    # the same value.
     lost_trace_cost_weight: float = 1.0
-    active_loss_risk_weight: float = 50_000.0
+    active_loss_risk_weight: float = 100_000.0
 
     # Rollout policy settings.
     rollout_random_action_probability: float = 0.10
 
-    # If True, a miss removes that target from the imagined branch's action set.
-    # Keep False if the real simulator uses permanent loss thresholds instead of
-    # immediate removal on miss.
     remove_missed_target_from_branch: bool = False
-
-    # "value" tends to work better during debugging because it directly chooses
-    # the action with best estimated objective. "visits" is the classic robust
-    # MCTS choice once the model is well tuned.
-    root_selection: Literal["visits", "value"] = "value"
+    root_selection: Literal["visits", "value"] = "visits"
 
     # Realtime conditional planning cache.
     current_action: int | None = None
@@ -450,6 +462,10 @@ class MCTSPlanner:
 
     def diagnostics(self) -> dict:
         return {
+            "mcts_objective_mode": self.objective_mode,
+            "mcts_rollout_auc_weight": float(self.rollout_auc_weight),
+            "mcts_terminal_state_weight": float(self.terminal_state_weight),
+            "mcts_use_average_cost_for_auc": bool(self.use_average_cost_for_auc),
             "mcts_current_action": self.current_action,
             "mcts_cached_find": self.cached_recommendations.get("find"),
             "mcts_cached_miss": self.cached_recommendations.get("miss"),
@@ -511,7 +527,6 @@ class MCTSPlanner:
             int(a) for a in root.unexpanded_actions if int(a) != int(fixed_action)
         ]
 
-        # Create both outcome states so we can extract both recommendations.
         for outcome in ("find", "miss"):
             next_state = self._transition(
                 root_state,
@@ -675,18 +690,7 @@ class MCTSPlanner:
         return self._terminal_value(state)
 
     def _terminal_value(self, state: PlanningState) -> float:
-        """Evaluate a rollout leaf.
-
-        We intentionally do not always propagate to full budget depletion.
-
-        If max_depth is small and remaining_budget is large, predicting all the
-        way to mission end can make every branch collapse into the same
-        catastrophic outcome. That destroys action ranking.
-
-        Instead:
-            - Evaluate the state reached by the rollout.
-            - Optionally predict a short terminal tail if terminal_tail_time > 0.
-        """
+        """Evaluate a rollout leaf according to objective_mode."""
 
         terminal = state.copy()
 
@@ -695,24 +699,67 @@ class MCTSPlanner:
             self._predict_all(terminal, tail_dt)
             terminal.remaining_budget = max(0.0, terminal.remaining_budget - tail_dt)
 
-        return -self._state_cost(terminal)
+            # If optimizing AUC/blended, include the terminal tail in accumulated cost.
+            if self.objective_mode in ("auc", "blended"):
+                self._accumulate_tracking_cost(terminal, tail_dt)
 
-    def _state_cost(self, state: PlanningState) -> float:
-        """System-level cost for a planning state.
+        terminal_cost = self._state_cost(terminal)
+        auc_cost = self._rollout_auc_cost(terminal)
 
-        Lower is better.
+        if self.objective_mode == "terminal":
+            total_cost = self.terminal_state_weight * terminal_cost
+        elif self.objective_mode == "auc":
+            total_cost = self.rollout_auc_weight * auc_cost
+        elif self.objective_mode == "blended":
+            total_cost = (
+                self.rollout_auc_weight * auc_cost
+                + self.terminal_state_weight * terminal_cost
+            )
+        else:
+            raise ValueError(
+                f"Unknown objective_mode={self.objective_mode!r}. "
+                "Expected 'terminal', 'auc', or 'blended'."
+            )
 
-        Cost terms:
+        return -float(total_cost)
+
+    def _rollout_auc_cost(self, state: PlanningState) -> float:
+        """Return accumulated or average tracking cost over imagined time."""
+
+        if self.use_average_cost_for_auc:
+            return float(
+                state.cumulative_tracking_cost / max(1e-6, state.cumulative_time)
+            )
+
+        return float(state.cumulative_tracking_cost)
+
+    def _accumulate_tracking_cost(
+        self,
+        state: PlanningState,
+        elapsed: float,
+    ) -> None:
+        """Accumulate time-integrated tracking cost for AUC objective."""
+
+        if elapsed <= 0.0:
+            return
+
+        instantaneous_cost = self._instantaneous_tracking_cost(state)
+
+        state.cumulative_tracking_cost += float(instantaneous_cost * elapsed)
+        state.cumulative_time += float(elapsed)
+
+    def _instantaneous_tracking_cost(self, state: PlanningState) -> float:
+        """Tracking cost at one imagined state.
+
+        This is the cost integrated over time for the AUC objective.
+
+        It intentionally mirrors the important evaluation terms:
             active uncertainty
-            lost target penalty
-            lost-state severity tie-breaker
-            active near-loss risk
-            optional travel distance penalty
-            optional detection bonus
+            lost-target penalty
+            near-loss risk
 
-        The lost-state severity term is important. Without it, many deep rollouts
-        can collapse to exactly -N * lost_target_penalty, making MCTS unable to rank
-        actions when several futures are bad.
+        It does not include detection reward by default, because detections are
+        only useful insofar as they reduce uncertainty.
         """
 
         active_uncertainty_cost = 0.0
@@ -725,29 +772,49 @@ class MCTSPlanner:
 
             if self._belief_is_lost(belief):
                 newly_lost_count += 1
-
-                # Tie-breaker: not all lost states are equally bad.
-                # Cap the trace contribution so numerical scale stays sane.
                 capped_trace = min(trace, 5.0 * self.lost_trace_threshold)
                 lost_severity_cost += self.lost_trace_cost_weight * capped_trace
                 continue
 
-            if self.use_logdet_objective:
-                active_uncertainty_cost += belief.position_logdet
-            else:
-                active_uncertainty_cost += trace
+            active_uncertainty_cost += (
+                belief.position_logdet if self.use_logdet_objective else trace
+            )
 
-            # Soft risk term for active tracks approaching loss.
-            # This starts mattering before the hard lost threshold is crossed.
-            if self.lost_trace_threshold > 0.0:
-                loss_fraction = trace / self.lost_trace_threshold
+            active_risk_cost += self._active_loss_risk_cost_from_trace(trace)
 
-                if loss_fraction > 0.5:
-                    normalized_risk = (loss_fraction - 0.5) / 0.5
-                    active_risk_cost += (
-                        self.active_loss_risk_weight
-                        * float(normalized_risk**2)
-                    )
+        lost_target_cost = self.lost_target_penalty * (
+            int(state.lost_count_initial) + int(newly_lost_count)
+        )
+
+        return float(
+            self.uncertainty_weight * active_uncertainty_cost
+            + lost_target_cost
+            + lost_severity_cost
+            + active_risk_cost
+        )
+
+    def _state_cost(self, state: PlanningState) -> float:
+        """System-level terminal cost for a planning state."""
+
+        active_uncertainty_cost = 0.0
+        newly_lost_count = 0
+        lost_severity_cost = 0.0
+        active_risk_cost = 0.0
+
+        for belief in state.beliefs.values():
+            trace = float(belief.position_trace)
+
+            if self._belief_is_lost(belief):
+                newly_lost_count += 1
+                capped_trace = min(trace, 5.0 * self.lost_trace_threshold)
+                lost_severity_cost += self.lost_trace_cost_weight * capped_trace
+                continue
+
+            active_uncertainty_cost += (
+                belief.position_logdet if self.use_logdet_objective else trace
+            )
+
+            active_risk_cost += self._active_loss_risk_cost_from_trace(trace)
 
         uncertainty_cost = self.uncertainty_weight * active_uncertainty_cost
 
@@ -767,6 +834,20 @@ class MCTSPlanner:
             - detection_bonus
         )
 
+    def _active_loss_risk_cost_from_trace(self, trace: float) -> float:
+        """Soft cost for active tracks approaching the lost threshold."""
+
+        if self.lost_trace_threshold <= 0.0:
+            return 0.0
+
+        loss_fraction = float(trace) / self.lost_trace_threshold
+
+        if loss_fraction <= 0.5:
+            return 0.0
+
+        normalized_risk = (loss_fraction - 0.5) / 0.5
+        return float(self.active_loss_risk_weight * normalized_risk**2)
+
     def _belief_is_lost(self, belief: BeliefState) -> bool:
         return belief.position_trace >= self.lost_trace_threshold
 
@@ -776,13 +857,7 @@ class MCTSPlanner:
         drone: Drone,
         rng: np.random.Generator,
     ) -> int:
-        """Choose a rollout action.
-
-        This does not use a hard cooldown.
-
-        Repeated revisits are discouraged naturally because a recently detected
-        target has little marginal uncertainty left to reduce.
-        """
+        """Choose a rollout action."""
 
         actions = [
             int(action)
@@ -810,16 +885,7 @@ class MCTSPlanner:
         action: int,
         drone: Drone,
     ) -> float:
-        """Heuristic score for choosing an action inside rollouts/tree expansion.
-
-        Higher is better.
-
-        Principle:
-            Score expected marginal value, not raw uncertainty.
-
-        This avoids repeatedly choosing an easy target that was just detected.
-        If its covariance is already low, another detection has little value.
-        """
+        """Heuristic score for choosing an action inside rollouts/tree expansion."""
 
         belief = state.beliefs[int(action)]
 
@@ -838,9 +904,6 @@ class MCTSPlanner:
         )
 
         loss_risk_multiplier = self._loss_risk_multiplier(belief)
-
-        # This is a soft staleness bonus, not a rule. Marginal uncertainty is
-        # still the main value term.
         stale_bonus = 1.0 + min(2.0, belief.time_since_seen / 120.0)
 
         score = (
@@ -853,20 +916,11 @@ class MCTSPlanner:
         return float(score)
 
     def _expected_detection_value(self, belief: BeliefState) -> float:
-        """Approximate marginal value of detecting this track.
-
-        A recently detected track may have very low covariance. Detecting it
-        again should not be considered very valuable. This naturally discourages
-        camping without banning revisits.
-        """
+        """Approximate marginal value of detecting this track."""
 
         if self.use_logdet_objective:
-            # Most debugging should use trace mode. Keep logdet mode simple.
             return float(max(0.0, belief.position_logdet))
 
-        # Approximate post-detection trace floor. For a 2D position measurement
-        # with measurement_noise_std, the best reasonable position trace is on
-        # the order of 2 * R.
         measurement_trace_floor = (
             self.measurement_trace_floor_scale
             * (self.measurement_noise_std ** 2)
@@ -875,18 +929,13 @@ class MCTSPlanner:
         return float(max(0.0, belief.position_trace - measurement_trace_floor))
 
     def _loss_risk_multiplier(self, belief: BeliefState) -> float:
-        """Increase priority for tracks approaching permanent loss.
-
-        This is not a target-rotation rule. It encodes the actual mission
-        objective: crossing the lost threshold is catastrophic.
-        """
+        """Increase priority for tracks approaching permanent loss."""
 
         if self.lost_trace_threshold <= 0.0:
             return 1.0
 
         loss_fraction = belief.position_trace / self.lost_trace_threshold
 
-        # Below half the threshold, do not distort the heuristic.
         if loss_fraction <= 0.5:
             return 1.0
 
@@ -970,6 +1019,11 @@ class MCTSPlanner:
             active_actions = tuple(a for a in active_actions if int(a) != int(action))
 
         next_state.available_actions = active_actions
+
+        # Accumulate AUC-style tracking cost after the action has affected the state.
+        if self.objective_mode in ("auc", "blended"):
+            self._accumulate_tracking_cost(next_state, elapsed)
+
         return next_state
 
     def _estimate_coverage_outcome(
@@ -978,13 +1032,7 @@ class MCTSPlanner:
         action: int,
         drone: Drone,
     ) -> CoverageEstimate:
-        """Estimate P(find), E[T_find], and T_miss for pursuing a target.
-
-        Approximation:
-            covered area ~= sensor_width * drone_speed * t + initial footprint
-            normalized area ~= covered_area / effective_covariance_area
-            P(find by t) ~= 1 - exp(-normalized / 2)
-        """
+        """Estimate P(find), E[T_find], and T_miss for pursuing a target."""
 
         belief = state.beliefs[int(action)].copy()
 
@@ -1004,7 +1052,6 @@ class MCTSPlanner:
                 miss_time=0.0,
             )
 
-        # Belief grows while we travel to the target's current predicted center.
         belief.predict(travel_time, self.acceleration_noise_std)
 
         num_steps = max(8, int(math.ceil(miss_time / 1.0)))
@@ -1102,6 +1149,8 @@ class MCTSPlanner:
             depth=0,
             distance_traveled=0.0,
             detections=0,
+            cumulative_tracking_cost=0.0,
+            cumulative_time=0.0,
             lost_count_initial=int(lost_count_initial),
         )
 

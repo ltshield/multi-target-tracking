@@ -80,13 +80,18 @@ class EllipticShiftingSpiralPlanner:
         sensor_width: float,
         dt: float,
         covariance_scale: float = 2.0,
+        lead_time: float = 0.0,
     ) -> "EllipticShiftingSpiralPlanner":
         mean = cls._as_vector(track.mean, 4, "track.mean")
         covariance = cls._as_matrix(track.covariance, (4, 4), "track.covariance")
 
+        position = mean[:2]
+        velocity = mean[2:4]
+        predicted_center = position + velocity * max(0.0, float(lead_time))
+
         return cls(
-            center0=mean[:2],
-            velocity=mean[2:4],
+            center0=predicted_center,
+            velocity=velocity,
             position_covariance=covariance[:2, :2],
             sensor_width=sensor_width,
             dt=dt,
